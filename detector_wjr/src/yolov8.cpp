@@ -1,8 +1,5 @@
 #include "detector/yolov8.hpp"
 
-#include <algorithm>
-#include <cstring>
-
 // Define gLogger
 class Logger : public nvinfer1::ILogger {
   void log(Severity severity, const char *msg) noexcept override {
@@ -16,35 +13,26 @@ class Logger : public nvinfer1::ILogger {
 detector::YoloV8::YoloV8() {
   host_inputs =
       new float[batch_size * 3 * input_h * input_w]; // 分配 host_inputs
-  host_outputs = new float[output_size];
+  host_outputs = new float[38001];
 }
 
 detector::YoloV8::~YoloV8() {
-  if (cuda_inputs) {
-    cudaFree(cuda_inputs);
-  }
-  if (cuda_outputs) {
-    cudaFree(cuda_outputs);
-  }
-  if (stream) {
-    cudaStreamDestroy(stream);
-  }
-  delete[] host_inputs;
-  delete[] host_outputs;
-  delete context;
-  delete engine;
-  delete runtime;
+  // Free CUDA memory
+  cudaFree(cuda_inputs);
+  cudaFree(cuda_outputs);
+  // Destroy stream
+  cudaStreamDestroy(stream);
+  // Free bindings
+  free(bindings);
 }
 
 int detector::YoloV8::init(std::string engine_path, std::string plugin_path) {
 #ifndef PLUGIN_REGIST
 #define PLUGIN_REGIST
-  if (!plugin_path.empty()) {
-    void *handle = dlopen(plugin_path.c_str(), RTLD_LAZY);
-    if (!handle) {
-      std::cerr << "Error loading plugin library: " << dlerror() << std::endl;
-      return -1;
-    }
+  void *handle = dlopen(plugin_path.c_str(), RTLD_LAZY);
+  if (!handle) {
+    std::cerr << "Error loading plugin library: " << dlerror() << std::endl;
+    return -1;
   }
 #endif
 
@@ -59,105 +47,36 @@ int detector::YoloV8::init(std::string engine_path, std::string plugin_path) {
 
   // Deserialize the engine and create context
   runtime = nvinfer1::createInferRuntime(gLogger);
-  if (!runtime) {
-    std::cerr << "Error: Failed to create TensorRT runtime" << std::endl;
-    return -1;
-  }
-
-  std::vector<char> engine_data((std::istreambuf_iterator<char>(engine_file)),
+  std::ifstream file(engine_path, std::ios::binary);
+  std::vector<char> engine_data((std::istreambuf_iterator<char>(file)),
                                 std::istreambuf_iterator<char>());
-  engine =
-      runtime->deserializeCudaEngine(engine_data.data(), engine_data.size());
-  if (!engine) {
-    std::cerr << "Error: Failed to deserialize TensorRT engine" << std::endl;
-    return -1;
-  }
-
+  engine = runtime->deserializeCudaEngine(engine_data.data(),
+                                          engine_data.size(), nullptr);
   context = engine->createExecutionContext();
-  if (!context) {
-    std::cerr << "Error: Failed to create execution context" << std::endl;
-    return -1;
-  }
-
-  if (!resolveTensorNames()) {
-    return -1;
-  }
-
-  auto checkCuda = [](cudaError_t status, const char *action) {
-    if (status != cudaSuccess) {
-      std::cerr << "CUDA error(" << action
-                << "): " << cudaGetErrorString(status) << std::endl;
-      return false;
-    }
-    return true;
-  };
-
   // Allocate GPU memory
-  if (!checkCuda(cudaMalloc(reinterpret_cast<void **>(&cuda_inputs),
-                            batch_size * 3 * input_h * input_w * sizeof(float)),
-                 "cudaMalloc(inputs)")) {
-    return -1;
-  }
-  if (!checkCuda(cudaMalloc(reinterpret_cast<void **>(&cuda_outputs),
-                            output_size * sizeof(float)),
-                 "cudaMalloc(outputs)")) {
-    return -1;
-  }
+  cudaMalloc((void **)&cuda_inputs,
+             batch_size * 3 * input_h * input_w * sizeof(float));
+  cudaMalloc((void **)&cuda_outputs,
+             38001 * sizeof(float)); // Output size based on model
 
-  if (!checkCuda(cudaStreamCreate(&stream), "cudaStreamCreate")) {
-    return -1;
-  }
+  cudaStreamCreate(&stream);
 
-  if (!context->setTensorAddress(input_tensor_name_.c_str(), cuda_inputs) ||
-      !context->setTensorAddress(output_tensor_name_.c_str(), cuda_outputs)) {
-    std::cerr << "Error: Failed to bind TensorRT tensor addresses" << std::endl;
-    return -1;
+  bindings = new void *[2];
+  bindings[0] = cuda_inputs;
+  bindings[1] = cuda_outputs;
+  if (engine->hasImplicitBatchDimension()) {
+    std::cout << "Engine uses implicit batch mode." << std::endl;
+  } else {
+    std::cout << "Engine uses explicit batch mode." << std::endl;
   }
 
   return 0;
 }
 
-bool detector::YoloV8::resolveTensorNames() {
-  if (!engine) {
-    std::cerr << "Error: Engine is not ready when resolving tensor names"
-              << std::endl;
-    return false;
-  }
-
-  const int32_t tensor_count = engine->getNbIOTensors();
-  std::vector<std::string> input_names;
-  std::vector<std::string> output_names;
-
-  for (int32_t i = 0; i < tensor_count; ++i) {
-    const char *name = engine->getIOTensorName(i);
-    if (name == nullptr) {
-      continue;
-    }
-    auto mode = engine->getTensorIOMode(name);
-    if (mode == nvinfer1::TensorIOMode::kINPUT) {
-      input_names.emplace_back(name);
-    } else if (mode == nvinfer1::TensorIOMode::kOUTPUT) {
-      output_names.emplace_back(name);
-    }
-  }
-
-  if (input_names.size() != 1 || output_names.empty()) {
-    std::cerr << "Error: Expected exactly 1 input tensor and at least 1 output "
-                 "tensor, but got inputs="
-              << input_names.size() << " outputs=" << output_names.size()
-              << std::endl;
-    return false;
-  }
-
-  input_tensor_name_ = input_names.front();
-  output_tensor_name_ = output_names.front();
-  return true;
-}
-
 std::tuple<std::vector<cv::Mat>, double, std::vector<std::vector<float>>,
            std::vector<std::vector<float>>, std::vector<std::vector<int>>,
            std::vector<std::vector<float>>>
-detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator) {
+detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator, bool flag) {
   // Prepare batch
   std::vector<cv::Mat> batch_image_raw = {};
   std::vector<int> batch_origin_h = {};
@@ -166,7 +85,14 @@ detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator) {
 
   for (size_t i = 0; i < raw_image_generator.size(); ++i) {
     int origin_h = 640, origin_w = 640;
-    cv::Mat image_raw = raw_image_generator[i];
+    cv::Mat image_raw = raw_image_generator[i].clone();
+
+    // 空图判断
+    if (image_raw.empty()) {
+      std::cerr << "[Warning] Image at index " << i << " is empty, skipping."
+                << std::endl;
+      continue;
+    }
     cv::Mat input_image = preprocess_image(image_raw);
     // std::cout<<"perprocess done"<<std::endl;
     batch_image_raw.push_back(image_raw);
@@ -182,27 +108,15 @@ detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator) {
                   batch_size * 3 * input_h * input_w * sizeof(float),
                   cudaMemcpyHostToDevice, stream);
 
-  nvinfer1::Dims4 input_dims{batch_size, 3, input_h, input_w};
-  if (!context->setInputShape(input_tensor_name_.c_str(), input_dims)) {
-    std::cerr << "Error: Failed to set input shape" << std::endl;
-    return std::make_tuple(
-        batch_image_raw, 0.0, std::vector<std::vector<float>>{},
-        std::vector<std::vector<float>>{}, std::vector<std::vector<int>>{},
-        std::vector<std::vector<float>>{});
-  }
-
-  if (!context->allInputDimensionsSpecified()) {
-    std::cerr << "Error: Input dimensions are not fully specified" << std::endl;
-    return std::make_tuple(
-        batch_image_raw, 0.0, std::vector<std::vector<float>>{},
-        std::vector<std::vector<float>>{}, std::vector<std::vector<int>>{},
-        std::vector<std::vector<float>>{});
-  }
-
   // Execute the inference
   auto start = std::chrono::high_resolution_clock::now();
-  if (!context->enqueueV3(stream)) {
-    std::cerr << "Error: enqueueV3 failed" << std::endl;
+  // 使用enqueueV2替代enqueue enqueueV2不支持隐式batch 导出模型时要注意
+  // 用回enqueue
+  auto input_dims = context->getBindingDimensions(0);
+
+  bool status = context->enqueue(batch_size,bindings, stream, nullptr);
+  if (!status) {
+    std::cerr << "错误: 推理执行失败" << std::endl;
   }
   cudaMemcpyAsync(host_outputs, cuda_outputs, output_size * sizeof(float),
                   cudaMemcpyDeviceToHost, stream);
@@ -215,10 +129,11 @@ detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator) {
   std::vector<std::vector<float>> det = {};
 
   for (int i = 0; i < batch_size; ++i) {
-    auto output_offset = host_outputs + i * output_size;
+    auto output_offset =
+        host_outputs + i * 38001; // Adjust based on output size
     auto post_result =
         YoloV8::post_process(output_offset, raw_image_generator[i].cols,
-                             raw_image_generator[i].rows, output_size);
+                             raw_image_generator[i].rows, 38001, flag);
     result_boxes.push_back(std::get<0>(post_result));
     result_scores.push_back(std::get<1>(post_result));
     result_classID.push_back(std::get<2>(post_result));
@@ -286,15 +201,15 @@ cv::Mat detector::YoloV8::preprocess_image(const cv::Mat &raw_bgr_image) {
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
 detector::YoloV8::non_max_suppression(std::vector<float> &boxes,
                                       std::vector<float> scores,
-                                      std::vector<int> classID,
-                                      float threshold) {
+                                      std::vector<int> classID, float threshold,
+                                      bool flag = true) {
   std::vector<float> keep_boxes, keep_scores;
   std::vector<int> keep_IDs;
   if (boxes.size() == 0) {
     return std::make_tuple(keep_boxes, keep_scores, keep_IDs);
   }
   for (size_t i = 0; i < scores.size(); ++i) {
-    // nms
+    // nmsimage_infer
     for (size_t j = i + 1; j < scores.size(); ++j) {
       if (scores[j] < threshold) {
         scores[j] = 0;
@@ -330,7 +245,7 @@ detector::YoloV8::non_max_suppression(std::vector<float> &boxes,
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
 detector::YoloV8::post_process(float *output, int origin_w, int origin_h,
-                               int output_size) {
+                               int output_size, bool flag) {
   std::vector<float> boxes = {};
   std::vector<float> scores = {};
   std::vector<float> det = {};
@@ -345,7 +260,7 @@ detector::YoloV8::post_process(float *output, int origin_w, int origin_h,
   float dh = (640 - scale * origin_h) / 2; // 垂直填充的高度
 
   int result_count = output[0];
-
+  
   for (int i = 1; i < result_count * 38; i += 38) {
     float score = output[i + 4];  // 第5个元素是置信度
     int classID_ = output[i + 5]; // 第6个元素是类别ID

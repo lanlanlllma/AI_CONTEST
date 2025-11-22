@@ -1,8 +1,5 @@
 #include "detector/lw_detr.hpp"
 
-#include <algorithm>
-#include <cstring>
-
 // 定义Logger
 static class Logger : public nvinfer1::ILogger {
   void log(Severity severity, const char *msg) noexcept override {
@@ -34,44 +31,88 @@ detector::LwDetr::~LwDetr() {
   delete[] host_inputs;
 
   for (int i = 0; i < NUM_THREAD; i++) {
+    // 释放CPU和GPU内存
+
     delete[] contexts_[i].host_dets;
     delete[] contexts_[i].host_labels;
 
-    if (contexts_[i].cuda_input) {
-      cudaFree(contexts_[i].cuda_input);
-    }
-    if (contexts_[i].cuda_dets) {
-      cudaFree(contexts_[i].cuda_dets);
-    }
-    if (contexts_[i].cuda_labels) {
-      cudaFree(contexts_[i].cuda_labels);
-    }
+    cudaFree(contexts_[i].cuda_input);
+    cudaFree(contexts_[i].cuda_dets);
+    cudaFree(contexts_[i].cuda_labels);
 
-    if (contexts_[i].stream) {
-      cudaStreamDestroy(contexts_[i].stream);
-    }
+    // 销毁CUDA流
+    cudaStreamDestroy(contexts_[i].stream);
 
-    delete contexts_[i].context;
+    // 释放TensorRT资源
+    contexts_[i].context->destroy();
   }
 
-  delete engine;
-  delete runtime;
+  engine->destroy();
+  runtime->destroy();
+
+  // 释放绑定
+  for (int i = 0; i < NUM_THREAD; i++) {
+    delete[] contexts_[i].bindings;
+  }
 }
 
 int detector::LwDetr::init(std::string engine_path, std::string plugin_path) {
   // 加载插件库
 #ifndef PLUGIN_REGIST
 #define PLUGIN_REGIST
-  if (!plugin_path.empty()) {
-    void *handle = dlopen(plugin_path.c_str(), RTLD_LAZY);
-    if (!handle) {
-      std::cerr << "错误: 加载插件库失败: " << dlerror() << std::endl;
-      return -1;
-    }
+  void *handle = dlopen(plugin_path.c_str(), RTLD_LAZY);
+  if (!handle) {
+    std::cerr << "错误: 加载插件库失败: " << dlerror() << std::endl;
+    return -1;
   }
 #endif
 
-  return init(engine_path);
+  // 初始化NvInfer插件
+  initLibNvInferPlugins(&gLogger, "");
+
+  // 加载引擎文件
+  std::ifstream engine_file(engine_path, std::ios::binary);
+  if (!engine_file) {
+    std::cerr << "错误: 无法打开引擎文件: " << engine_path << std::endl;
+    return -1;
+  }
+
+  // 加载和反序列化引擎
+  runtime = nvinfer1::createInferRuntime(gLogger);
+  std::vector<char> engine_data((std::istreambuf_iterator<char>(engine_file)),
+                                std::istreambuf_iterator<char>());
+  engine = runtime->deserializeCudaEngine(engine_data.data(),
+                                          engine_data.size(), nullptr);
+  for (int i = 0; i < NUM_THREAD; i++) {
+    contexts_[i].context = engine->createExecutionContext();
+  }
+
+  // 验证引擎输入输出
+  if (engine->getNbBindings() != 3) { // 输入+2个输出(检测框和类别)
+    std::cerr << "错误: LwDetr模型应有3个绑定点 (1个输入, 2个输出), 但找到 "
+              << engine->getNbBindings() << std::endl;
+    return -1;
+  }
+
+  for (int i = 0; i < NUM_THREAD; i++) {
+    // 分配GPU内存
+    cudaMalloc((void **)&contexts_[i].cuda_input,
+               batch_size * 3 * input_h * input_w * sizeof(float));
+    cudaMalloc((void **)&contexts_[i].cuda_dets,
+               batch_size * num_boxes * 4 * sizeof(float));
+    cudaMalloc((void **)&contexts_[i].cuda_labels,
+               batch_size * num_boxes * num_classes * sizeof(float));
+
+    // 创建CUDA流
+    cudaStreamCreate(&contexts_[i].stream);
+
+    // 设置输入输出绑定
+    contexts_[i].bindings = new void *[3]; // 1个输入 + 2个输出
+    contexts_[i].bindings[0] = contexts_[i].cuda_input;  // 输入图像
+    contexts_[i].bindings[1] = contexts_[i].cuda_dets;   // 输出检测框
+    contexts_[i].bindings[2] = contexts_[i].cuda_labels; // 输出类别概率
+  }
+  return 0;
 }
 int detector::LwDetr::init(std::string engine_path) {
   // 初始化NvInfer插件
@@ -86,133 +127,42 @@ int detector::LwDetr::init(std::string engine_path) {
 
   // 加载和反序列化引擎
   runtime = nvinfer1::createInferRuntime(gLogger);
-  if (!runtime) {
-    std::cerr << "错误: 创建TensorRT运行时时失败" << std::endl;
-    return -1;
-  }
-
   std::vector<char> engine_data((std::istreambuf_iterator<char>(engine_file)),
                                 std::istreambuf_iterator<char>());
-  engine =
-      runtime->deserializeCudaEngine(engine_data.data(), engine_data.size());
-  if (!engine) {
-    std::cerr << "错误: 反序列化TensorRT引擎失败" << std::endl;
-    return -1;
-  }
-
-  if (!resolveTensorNames()) {
-    return -1;
-  }
-
-  auto checkCuda = [](cudaError_t status, const char *action) {
-    if (status != cudaSuccess) {
-      std::cerr << "CUDA错误(" << action << "): " << cudaGetErrorString(status)
-                << std::endl;
-      return false;
-    }
-    return true;
-  };
+  engine = runtime->deserializeCudaEngine(engine_data.data(),
+                                          engine_data.size(), nullptr);
 
   for (int i = 0; i < NUM_THREAD; i++) {
     contexts_[i].context = engine->createExecutionContext();
-    if (!contexts_[i].context) {
-      std::cerr << "错误: 创建执行上下文失败" << std::endl;
-      return -1;
-    }
+  }
 
-    if (!checkCuda(
-            cudaMalloc(reinterpret_cast<void **>(&contexts_[i].cuda_input),
-                       batch_size * 3 * input_h * input_w * sizeof(float)),
-            "cudaMalloc(input)")) {
-      return -1;
-    }
-    if (!checkCuda(
-            cudaMalloc(reinterpret_cast<void **>(&contexts_[i].cuda_dets),
-                       batch_size * num_boxes * 4 * sizeof(float)),
-            "cudaMalloc(dets)")) {
-      return -1;
-    }
-    if (!checkCuda(
-            cudaMalloc(reinterpret_cast<void **>(&contexts_[i].cuda_labels),
-                       batch_size * num_boxes * num_classes * sizeof(float)),
-            "cudaMalloc(labels)")) {
-      return -1;
-    }
+  // 验证引擎输入输出
+  if (engine->getNbBindings() != 3) { // 输入+2个输出(检测框和类别)
+    std::cerr << "错误: LwDetr模型应有3个绑定点 (1个输入, 2个输出), 但找到 "
+              << engine->getNbBindings() << std::endl;
+    return -1;
+  }
 
-    if (!checkCuda(cudaStreamCreate(&contexts_[i].stream),
-                   "cudaStreamCreate")) {
-      return -1;
-    }
+  for (int i = 0; i < NUM_THREAD; i++) {
+    // 分配GPU内存
+    cudaMalloc((void **)&contexts_[i].cuda_input,
+               batch_size * 3 * input_h * input_w * sizeof(float));
+    cudaMalloc((void **)&contexts_[i].cuda_dets,
+               batch_size * num_boxes * 4 * sizeof(float));
+    cudaMalloc((void **)&contexts_[i].cuda_labels,
+               batch_size * num_boxes * num_classes * sizeof(float));
 
-    bool address_ok =
-        contexts_[i].context->setTensorAddress(input_tensor_name_.c_str(),
-                                               contexts_[i].cuda_input) &&
-        contexts_[i].context->setTensorAddress(boxes_tensor_name_.c_str(),
-                                               contexts_[i].cuda_dets) &&
-        contexts_[i].context->setTensorAddress(labels_tensor_name_.c_str(),
-                                               contexts_[i].cuda_labels);
-    if (!address_ok) {
-      std::cerr << "错误: 绑定TensorRT张量地址失败" << std::endl;
-      return -1;
-    }
+    // 创建CUDA流
+    cudaStreamCreate(&contexts_[i].stream);
+
+    // 设置输入输出绑定
+    contexts_[i].bindings = new void *[3]; // 1个输入 + 2个输出
+    contexts_[i].bindings[0] = contexts_[i].cuda_input;  // 输入图像
+    contexts_[i].bindings[1] = contexts_[i].cuda_dets;   // 输出检测框
+    contexts_[i].bindings[2] = contexts_[i].cuda_labels; // 输出类别概率
   }
 
   return 0;
-}
-
-bool detector::LwDetr::resolveTensorNames() {
-  if (!engine) {
-    std::cerr << "错误: 引擎尚未初始化，无法解析张量信息" << std::endl;
-    return false;
-  }
-
-  const int32_t tensor_count = engine->getNbIOTensors();
-  std::vector<std::string> input_names;
-  std::vector<std::string> output_names;
-  input_names.reserve(1);
-  output_names.reserve(2);
-
-  for (int32_t i = 0; i < tensor_count; ++i) {
-    const char *tensor_name = engine->getIOTensorName(i);
-    if (tensor_name == nullptr) {
-      continue;
-    }
-    auto mode = engine->getTensorIOMode(tensor_name);
-    if (mode == nvinfer1::TensorIOMode::kINPUT) {
-      input_names.emplace_back(tensor_name);
-    } else if (mode == nvinfer1::TensorIOMode::kOUTPUT) {
-      output_names.emplace_back(tensor_name);
-    }
-  }
-
-  if (input_names.size() != 1 || output_names.size() < 2) {
-    std::cerr << "错误: 期望1个输入和2个输出张量，实际输入数量="
-              << input_names.size() << " 输出数量=" << output_names.size()
-              << std::endl;
-    return false;
-  }
-
-  input_tensor_name_ = input_names.front();
-
-  for (const auto &name : output_names) {
-    auto dims = engine->getTensorShape(name.c_str());
-    int32_t last_dim = (dims.nbDims > 0) ? dims.d[dims.nbDims - 1] : -1;
-    if (last_dim == 4 && boxes_tensor_name_.empty()) {
-      boxes_tensor_name_ = name;
-    } else if (last_dim == num_classes && labels_tensor_name_.empty()) {
-      labels_tensor_name_ = name;
-    }
-  }
-
-  if (boxes_tensor_name_.empty()) {
-    boxes_tensor_name_ = output_names[0];
-  }
-  if (labels_tensor_name_.empty()) {
-    labels_tensor_name_ =
-        (output_names.size() > 1) ? output_names[1] : output_names[0];
-  }
-
-  return true;
 }
 
 std::tuple<std::vector<cv::Mat>, double, std::vector<std::vector<float>>,
@@ -254,14 +204,7 @@ detector::LwDetr::infer(std::vector<cv::Mat> &raw_image_generator,
 
   // 设置输入张量的维度
   nvinfer1::Dims4 inputDims{batch_size, 3, input_h, input_w};
-  if (!contexts_[thread_id].context->setInputShape(input_tensor_name_.c_str(),
-                                                   inputDims)) {
-    std::cerr << "错误: 设置输入维度失败" << std::endl;
-    return std::make_tuple(
-        batch_image_raw, 0.0, std::vector<std::vector<float>>{},
-        std::vector<std::vector<float>>{}, std::vector<std::vector<int>>{},
-        std::vector<std::vector<float>>{});
-  }
+  contexts_[thread_id].context->setBindingDimensions(0, inputDims);
 
   // 检查维度是否有效
   if (!contexts_[thread_id].context->allInputDimensionsSpecified()) {
@@ -274,8 +217,11 @@ detector::LwDetr::infer(std::vector<cv::Mat> &raw_image_generator,
 
   // 执行推理
   auto start = std::chrono::high_resolution_clock::now();
-  bool status =
-      contexts_[thread_id].context->enqueueV3(contexts_[thread_id].stream);
+  // 使用enqueueV2替代enqueue
+  auto input_dims = contexts_[thread_id].context->getBindingDimensions(0);
+
+  bool status = contexts_[thread_id].context->enqueueV2(
+      contexts_[thread_id].bindings, contexts_[thread_id].stream, nullptr);
   if (!status) {
     std::cerr << "错误: 推理执行失败" << std::endl;
   }
@@ -351,7 +297,8 @@ cv::Mat detector::LwDetr::preprocess_image(const cv::Mat &img) {
         需要合理控制并发流数量以避免过度竞争
   3. 多配置文件引擎
   */
-  // 基于coco预训练的mean和std
+
+  //基于coco预训练的mean和std
   const float mean[3] = {0.485, 0.456, 0.406};
   const float std[3] = {0.229, 0.224, 0.225};
 
@@ -367,81 +314,6 @@ cv::Mat detector::LwDetr::preprocess_image(const cv::Mat &img) {
   }
 
   return cv::Mat(1, 3 * input_h * input_w, CV_32FC1, chw_data.data()).clone();
-}
-
-std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
-detector::LwDetr::non_max_suppression(const std::vector<float> &boxes,
-                                      const std::vector<float> &scores,
-                                      const std::vector<int> &class_id,
-                                      float iou_threshold) {
-  std::vector<float> keep_boxes;
-  std::vector<float> keep_scores;
-  std::vector<int> keep_ids;
-
-  if (boxes.empty()) {
-    return std::make_tuple(keep_boxes, keep_scores, keep_ids);
-  }
-
-  const size_t box_count = scores.size();
-  std::vector<int> order(box_count);
-  std::iota(order.begin(), order.end(), 0);
-  std::sort(order.begin(), order.end(),
-            [&](int lhs, int rhs) { return scores[lhs] > scores[rhs]; });
-
-  std::vector<bool> suppressed(box_count, false);
-  for (size_t i = 0; i < order.size(); ++i) {
-    int idx = order[i];
-    if (suppressed[idx]) {
-      continue;
-    }
-    if (scores[idx] < THRESHOLD) {
-      continue;
-    }
-
-    keep_boxes.insert(keep_boxes.end(),
-                      {boxes[idx * 4], boxes[idx * 4 + 1], boxes[idx * 4 + 2],
-                       boxes[idx * 4 + 3]});
-    keep_scores.push_back(scores[idx]);
-    keep_ids.push_back(class_id[idx]);
-
-    for (size_t j = i + 1; j < order.size(); ++j) {
-      int next_idx = order[j];
-      if (suppressed[next_idx]) {
-        continue;
-      }
-      if (class_id[next_idx] != class_id[idx]) {
-        continue;
-      }
-      float iou = bbox_iou(&boxes[idx * 4], &boxes[next_idx * 4]);
-      if (iou > iou_threshold) {
-        suppressed[next_idx] = true;
-      }
-    }
-  }
-
-  return std::make_tuple(keep_boxes, keep_scores, keep_ids);
-}
-
-float detector::LwDetr::bbox_iou(const float *box1, const float *box2) {
-  float x1 = std::max(box1[0], box2[0]);
-  float y1 = std::max(box1[1], box2[1]);
-  float x2 = std::min(box1[2], box2[2]);
-  float y2 = std::min(box1[3], box2[3]);
-
-  float inter_w = std::max(0.0f, x2 - x1);
-  float inter_h = std::max(0.0f, y2 - y1);
-  float inter_area = inter_w * inter_h;
-
-  float area1 =
-      std::max(0.0f, box1[2] - box1[0]) * std::max(0.0f, box1[3] - box1[1]);
-  float area2 =
-      std::max(0.0f, box2[2] - box2[0]) * std::max(0.0f, box2[3] - box2[1]);
-
-  float denom = area1 + area2 - inter_area;
-  if (denom <= 0.0f) {
-    return 0.0f;
-  }
-  return inter_area / denom;
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
@@ -518,4 +390,65 @@ detector::LwDetr::post_process(float *dets, float *labels, int origin_w,
 
   // 执行非极大值抑制
   return non_max_suppression(boxes, scores, classID, NMS_THRESHOLD);
+  return std::make_tuple(boxes, scores, classID);
+}
+
+std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
+detector::LwDetr::non_max_suppression(std::vector<float> &boxes,
+                                      std::vector<float> scores,
+                                      std::vector<int> classID,
+                                      float threshold) {
+  std::vector<float> keep_boxes, keep_scores;
+  std::vector<int> keep_IDs;
+  if (boxes.size() == 0) {
+    return std::make_tuple(keep_boxes, keep_scores, keep_IDs);
+  }
+  for (size_t i = 0; i < scores.size(); ++i) {
+    // nmsimage_infer
+    for (size_t j = i + 1; j < scores.size(); ++j) {
+      if (scores[j] < threshold) {
+        scores[j] = 0;
+        continue;
+      }
+      cv::Rect box1(boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2],
+                    boxes[i * 4 + 3]);
+      cv::Rect box2(boxes[j * 4], boxes[j * 4 + 1], boxes[j * 4 + 2],
+                    boxes[j * 4 + 3]);
+      float iou = bbox_iou(box1, box2);
+      if (iou > 0.5) {
+        if (scores[i] > scores[j]) {
+          scores[j] = 0;
+        } else {
+          scores[i] = 0;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < scores.size(); ++i) {
+    if (scores[i] > threshold) {
+      keep_boxes.push_back(boxes[i * 4]);
+      keep_boxes.push_back(boxes[i * 4 + 1]);
+      keep_boxes.push_back(boxes[i * 4 + 2]);
+      keep_boxes.push_back(boxes[i * 4 + 3]);
+      keep_scores.push_back(scores[i]);
+      keep_IDs.push_back(classID[i]);
+    }
+  }
+
+  return std::make_tuple(keep_boxes, keep_scores, keep_IDs);
+}
+
+// 辅助函数：计算两个矩形的IoU
+float detector::LwDetr::bbox_iou(const cv::Rect &box1, const cv::Rect &box2) {
+  int x1 = std::max(box1.x, box2.x);
+  int y1 = std::max(box1.y, box2.y);
+  int x2 = std::min(box1.x + box1.width, box2.x + box2.width);
+  int y2 = std::min(box1.y + box1.height, box2.y + box2.height);
+
+  int inter_area = std::max(0, x2 - x1) * std::max(0, y2 - y1);
+  int box1_area = box1.width * box1.height;
+  int box2_area = box2.width * box2.height;
+  float iou =
+      static_cast<float>(inter_area) / (box1_area + box2_area - inter_area);
+  return iou;
 }

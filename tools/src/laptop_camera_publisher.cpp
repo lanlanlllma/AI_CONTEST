@@ -5,8 +5,8 @@
 #include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/image.hpp>
 
 namespace utils {
 
@@ -15,23 +15,31 @@ public:
   LaptopCameraPublisher()
       : Node("laptop_camera_publisher"),
         camera_index_(declare_parameter<int>("camera_index", 0)),
-        topic_name_(declare_parameter<std::string>("topic_name", "/camera/color/image_raw")),
-        frame_id_(declare_parameter<std::string>("frame_id", "camera_color_frame")),
+        topic_name_(declare_parameter<std::string>("topic_name",
+                                                   "/camera/color/image_raw")),
+        frame_id_(
+            declare_parameter<std::string>("frame_id", "camera_color_frame")),
         publish_rate_(declare_parameter<double>("publish_rate", 30.0)),
         show_window_(declare_parameter<bool>("show_window", true)),
-        window_name_(declare_parameter<std::string>("window_name", "Laptop Camera")) {
-    auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
+        window_name_(
+            declare_parameter<std::string>("window_name", "Laptop Camera")) {
+    auto qos =
+        rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
     publisher_ = create_publisher<sensor_msgs::msg::Image>(topic_name_, qos);
 
     if (!capture_.open(camera_index_)) {
-      RCLCPP_FATAL(get_logger(), "Failed to open camera index %d", camera_index_);
+      RCLCPP_FATAL(get_logger(), "Failed to open camera index %d",
+                   camera_index_);
       throw std::runtime_error("Failed to open camera");
     }
 
-    const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / std::max(1.0, publish_rate_)));
-    timer_ = create_wall_timer(period, std::bind(&LaptopCameraPublisher::capture_and_publish, this));
+    const auto period = std::chrono::milliseconds(
+        static_cast<int>(1000.0 / std::max(1.0, publish_rate_)));
+    timer_ = create_wall_timer(
+        period, std::bind(&LaptopCameraPublisher::capture_and_publish, this));
 
-    RCLCPP_INFO(get_logger(), "Publishing laptop camera frames to %s", topic_name_.c_str());
+    RCLCPP_INFO(get_logger(), "Publishing laptop camera frames to %s",
+                topic_name_.c_str());
     if (show_window_) {
       cv::namedWindow(window_name_, cv::WINDOW_AUTOSIZE);
     }
@@ -49,11 +57,14 @@ private:
   void capture_and_publish() {
     cv::Mat frame;
     if (!capture_.read(frame)) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Failed to read frame from camera");
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Failed to read frame from camera");
       return;
     }
 
-    auto message = cv_bridge::CvImage(std_msgs::msg::Header(), sensor_msgs::image_encodings::BGR8, frame).toImageMsg();
+    auto message = cv_bridge::CvImage(std_msgs::msg::Header(),
+                                      sensor_msgs::image_encodings::BGR8, frame)
+                       .toImageMsg();
     message->header.stamp = now();
     message->header.frame_id = frame_id_;
     publisher_->publish(*message);
@@ -84,7 +95,8 @@ int main(int argc, char **argv) {
     auto node = std::make_shared<utils::LaptopCameraPublisher>();
     rclcpp::spin(node);
   } catch (const std::exception &ex) {
-    RCLCPP_FATAL(rclcpp::get_logger("laptop_camera_publisher"), "Unhandled exception: %s", ex.what());
+    RCLCPP_FATAL(rclcpp::get_logger("laptop_camera_publisher"),
+                 "Unhandled exception: %s", ex.what());
   }
   rclcpp::shutdown();
   return 0;

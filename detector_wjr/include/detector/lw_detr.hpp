@@ -13,20 +13,21 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/opencv.hpp>
-#include <string>
 #include <thread>
 #include <vector>
 
 namespace detector {
 
 struct InferContext {
-  nvinfer1::IExecutionContext *context{nullptr};
-  cudaStream_t stream{};
-  float *cuda_input{nullptr};
-  float *cuda_dets{nullptr};   // GPU检测框
-  float *cuda_labels{nullptr}; // GPU标签
-  float *host_dets{nullptr};   // 检测框输出[batch_size * num_boxes *4]
-  float *host_labels{nullptr}; // 标签输出 [batch, num_boxes, num_classes]
+  nvinfer1::IExecutionContext *context;
+  cudaStream_t stream;
+  float *cuda_input;
+  float *cuda_dets;   // GPU检测框
+  float *cuda_labels; // GPU标签
+  float *host_dets;   // 检测框输出[batch_size * num_boxes *4]
+                      // [x1,y1,x2,y2]左上角和右下角坐标
+  float *host_labels; // 标签输出 [batch, num_boxes, num_classes]
+  void **bindings;
 };
 
 // 定义LwDetr类
@@ -55,6 +56,12 @@ public:
              std::vector<std::vector<float>>>
   infer(std::vector<cv::Mat> &raw_image_generator, int thread_id);
 
+  std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
+  non_max_suppression(std::vector<float> &boxes, std::vector<float> scores,
+                      std::vector<int> classID, float threshold);
+
+  float bbox_iou(const cv::Rect &box1, const cv::Rect &box2);
+
 private:
   /*
    * @brief 图像预处理
@@ -75,33 +82,21 @@ private:
   post_process(float *dets, float *labels, int origin_w, int origin_h,
                int num_boxes, int num_classes);
 
-  std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
-  non_max_suppression(const std::vector<float> &boxes,
-                      const std::vector<float> &scores,
-                      const std::vector<int> &class_id, float iou_threshold);
-
-  float bbox_iou(const float *box1, const float *box2);
-
   std::vector<InferContext> contexts_; // 每个线程一个
 
-  int NUM_THREAD = 10; // 模型最大持有的线程
+  int NUM_THREAD = 10;     // 模型最大持有的线程
+  int NMS_THRESHOLD = 0.5; // NMS阈值
 
-  float *host_inputs{nullptr};
+  float *host_inputs;
 
-  int batch_size = 1; // 导出模型只有1
+  int batch_size = 1; //导出模型只有1
   int input_h = 640;
   int input_w = 640;
-  int num_boxes = 100;       // DETR输出的最大检测框数量
-  int num_classes = 91;      // DETR支持的类别数量
-  float THRESHOLD = 0.5;     // 置信度阈值
-  float NMS_THRESHOLD = 0.5; // NMS IoU阈值
-  nvinfer1::ICudaEngine *engine{nullptr};
-  nvinfer1::IRuntime *runtime{nullptr};
-  std::string input_tensor_name_;
-  std::string boxes_tensor_name_;
-  std::string labels_tensor_name_;
-
-  bool resolveTensorNames();
+  int num_boxes = 100;    // DETR输出的最大检测框数量
+  int num_classes = 91;   // DETR支持的类别数量
+  float THRESHOLD = 0.25; // 置信度阈值
+  nvinfer1::ICudaEngine *engine;
+  nvinfer1::IRuntime *runtime;
 };
 
 } // namespace detector
