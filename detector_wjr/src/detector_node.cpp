@@ -1,8 +1,8 @@
-#include "detector/detector_node.hpp"
+#include "detector_wjr/detector_node_wjr.hpp"
 
-detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
-    : Node("detector_node", options) {
-  RCLCPP_INFO(this->get_logger(), "detector_node start");
+detector_wjr::detector_node_wjr::detector_node_wjr(const rclcpp::NodeOptions &options)
+    : Node("detector_node_wjr", options) {
+  RCLCPP_INFO(this->get_logger(), "detector_node_wjr start");
 // 声明参数
 #ifdef USING_YOLOV8_CAR
   this->declare_parameter("model_path_car",
@@ -13,10 +13,8 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
       "/home/phoenix/tensorrtx/yolov8/build/libmyplugins.so");
 #endif
 #ifdef USING_LW_DETR_CAR
-  this->declare_parameter(
-      "model_path_car",
-      "/home/phoenix/ws_AImatch/model/lwdetr_medium_coco_1119/"
-      "inference_model.engine");
+  this->declare_parameter("model_path_car",
+                          "/home/ma/roboarm/LW-DETR/output/lwdetr_medium_coco/inference_model.engine");
   this->declare_parameter("plugin_path_car",
                           "/home/phoenix/roboarm/FairinoDualArm/src/detector/"
                           "asserts/layernorm_plugin.so");
@@ -25,8 +23,8 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
   this->declare_parameter("confidence_threshold", 0.65);
   this->declare_parameter("nms_threshold", 0.4);
 
-  this->declare_parameter("image_input_topic", "/image_for_radar");
-  this->declare_parameter("image_car_topic", "/detector/img_");
+  this->declare_parameter("image_input_topic", "/camera/color/image_raw");
+  this->declare_parameter("image_car_topic", "/detector/detections/iamge");
   this->declare_parameter("detections_topic", "/detections");
 
   this->declare_parameter("show_pic_detector", true);
@@ -67,7 +65,7 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
 
 //  初始化推理对象 car
 #ifdef USING_YOLOV8_CAR
-  detector_car_ = std::make_unique<detector::YoloV8>();
+  detector_car_ = std::make_unique<detector_wjr::YoloV8>();
   int ret_car = detector_car_->init(model_path_car_, plugin_path_car_);
   if (ret_car != 0) {
     RCLCPP_ERROR(this->get_logger(), "car的YOLOv8初始化失败，错误码: %d",
@@ -79,7 +77,7 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
   RCLCPP_INFO(this->get_logger(), "car模型初始化完成，正在加载armor模型...");
 #endif
 #ifdef USING_LW_DETR_CAR
-  detector_car_ = std::make_unique<detector::LwDetr>();
+  detector_car_ = std::make_unique<detector_wjr::LwDetr>();
   int ret_car = detector_car_->init(model_path_car_);
   if (ret_car != 0) {
     RCLCPP_ERROR(this->get_logger(), "car的LwDetr初始化失败，错误码: %d",
@@ -115,7 +113,7 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
   // 订阅图像
   img_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
       image_input_topic, rclcpp::SensorDataQoS(),
-      std::bind(&detector_node::image_callback, this, std::placeholders::_1));
+      std::bind(&detector_node_wjr::image_callback, this, std::placeholders::_1));
 
   //发布图像
   // cars_with_armor_pub =
@@ -126,7 +124,7 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
       this->create_publisher<sensor_msgs::msg::Image>(image_car_topic, 10);
 }
 
-void detector::detector_node::image_callback(
+void detector_wjr::detector_node_wjr::image_callback(
     const sensor_msgs::msg::Image::SharedPtr msg) {
   auto total_start = std::chrono::high_resolution_clock::now();
   // 输入验证
@@ -270,4 +268,4 @@ void detector::detector_node::image_callback(
 
 // 注册组件
 #include "rclcpp_components/register_node_macro.hpp"
-RCLCPP_COMPONENTS_REGISTER_NODE(detector::detector_node)
+RCLCPP_COMPONENTS_REGISTER_NODE(detector_wjr::detector_node_wjr)

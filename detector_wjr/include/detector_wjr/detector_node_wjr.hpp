@@ -4,8 +4,8 @@
 #define USING_LW_DETR_CAR
 // #define USING_YOLOV8_ARMOR
 
-#include "detector/yolov8.hpp"
-#include <cv_bridge/cv_bridge.h>
+#include "detector_wjr/yolov8.hpp"
+#include <cv_bridge/cv_bridge.hpp>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -16,17 +16,17 @@
 #include <string>
 #include <vector>
 
-#include "detector/lw_detr.hpp"
+#include "detector_wjr/lw_detr.hpp"
 
 #include <rclcpp_components/register_node_macro.hpp>
 
 #include <sstream>
 
-namespace detector {
+namespace detector_wjr {
 
 enum detector_type { CAR, ARMOR };
 
-class detector_node : public rclcpp::Node {
+class detector_node_wjr : public rclcpp::Node {
 
 // car
 //  YOLOv8推理对象
@@ -73,8 +73,8 @@ class detector_node : public rclcpp::Node {
   std::chrono::duration<double, std::micro> total_ms_img_clone;
 
 public:
-  explicit detector_node(const rclcpp::NodeOptions &options);
-  ~detector_node() = default;
+  explicit detector_node_wjr(const rclcpp::NodeOptions &options);
+  ~detector_node_wjr() = default;
 
 private:
   void rosbag_callback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
@@ -99,6 +99,6 @@ private:
   float bbox_iou(const cv::Rect &box1, const cv::Rect &box2);
 };
 
-} // namespace detector
+} // namespace detector_wjr
 
 #endif // DETECTOR_NODE_HPP

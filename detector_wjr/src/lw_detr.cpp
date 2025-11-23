@@ -1,4 +1,4 @@
-#include "detector/lw_detr.hpp"
+#include "detector_wjr/lw_detr.hpp"
 
 // 定义Logger
 static class Logger : public nvinfer1::ILogger {
@@ -10,7 +10,7 @@ static class Logger : public nvinfer1::ILogger {
   }
 } gLogger;
 
-detector::LwDetr::LwDetr() {
+detector_wjr::LwDetr::LwDetr() {
   // 分配模型输入内存
   host_inputs = new float[batch_size * 3 * input_h * input_w];
 
@@ -26,7 +26,7 @@ detector::LwDetr::LwDetr() {
   }
 }
 
-detector::LwDetr::~LwDetr() {
+detector_wjr::LwDetr::~LwDetr() {
 
   delete[] host_inputs;
 
@@ -56,7 +56,7 @@ detector::LwDetr::~LwDetr() {
   }
 }
 
-int detector::LwDetr::init(std::string engine_path, std::string plugin_path) {
+int detector_wjr::LwDetr::init(std::string engine_path, std::string plugin_path) {
   // 加载插件库
 #ifndef PLUGIN_REGIST
 #define PLUGIN_REGIST
@@ -114,7 +114,7 @@ int detector::LwDetr::init(std::string engine_path, std::string plugin_path) {
   }
   return 0;
 }
-int detector::LwDetr::init(std::string engine_path) {
+int detector_wjr::LwDetr::init(std::string engine_path) {
   // 初始化NvInfer插件
   initLibNvInferPlugins(&gLogger, "");
 
@@ -168,7 +168,7 @@ int detector::LwDetr::init(std::string engine_path) {
 std::tuple<std::vector<cv::Mat>, double, std::vector<std::vector<float>>,
            std::vector<std::vector<float>>, std::vector<std::vector<int>>,
            std::vector<std::vector<float>>>
-detector::LwDetr::infer(std::vector<cv::Mat> &raw_image_generator,
+detector_wjr::LwDetr::infer(std::vector<cv::Mat> &raw_image_generator,
                         int thread_id) {
   // 准备批处理输入
   std::vector<cv::Mat> batch_image_raw = {};
@@ -273,7 +273,7 @@ detector::LwDetr::infer(std::vector<cv::Mat> &raw_image_generator,
                          result_scores, result_classID, det);
 }
 
-cv::Mat detector::LwDetr::preprocess_image(const cv::Mat &img) {
+cv::Mat detector_wjr::LwDetr::preprocess_image(const cv::Mat &img) {
   cv::Mat resized, float_img, rgb_img;
   cv::resize(img, resized, cv::Size(input_w, input_h));
   cv::cvtColor(resized, rgb_img, cv::COLOR_BGR2RGB); // BGR -> RGB
@@ -317,7 +317,7 @@ cv::Mat detector::LwDetr::preprocess_image(const cv::Mat &img) {
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
-detector::LwDetr::post_process(float *dets, float *labels, int origin_w,
+detector_wjr::LwDetr::post_process(float *dets, float *labels, int origin_w,
                                int origin_h, int num_boxes, int num_classes) {
   std::vector<float> boxes;
   std::vector<float> scores;
@@ -394,7 +394,7 @@ detector::LwDetr::post_process(float *dets, float *labels, int origin_w,
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
-detector::LwDetr::non_max_suppression(std::vector<float> &boxes,
+detector_wjr::LwDetr::non_max_suppression(std::vector<float> &boxes,
                                       std::vector<float> scores,
                                       std::vector<int> classID,
                                       float threshold) {
@@ -439,7 +439,7 @@ detector::LwDetr::non_max_suppression(std::vector<float> &boxes,
 }
 
 // 辅助函数：计算两个矩形的IoU
-float detector::LwDetr::bbox_iou(const cv::Rect &box1, const cv::Rect &box2) {
+float detector_wjr::LwDetr::bbox_iou(const cv::Rect &box1, const cv::Rect &box2) {
   int x1 = std::max(box1.x, box2.x);
   int y1 = std::max(box1.y, box2.y);
   int x2 = std::min(box1.x + box1.width, box2.x + box2.width);

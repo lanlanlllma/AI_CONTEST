@@ -1,4 +1,4 @@
-#include "detector/yolov8.hpp"
+#include "detector_wjr/yolov8.hpp"
 
 // Define gLogger
 class Logger : public nvinfer1::ILogger {
@@ -10,13 +10,13 @@ class Logger : public nvinfer1::ILogger {
   }
 } gLogger;
 
-detector::YoloV8::YoloV8() {
+detector_wjr::YoloV8::YoloV8() {
   host_inputs =
       new float[batch_size * 3 * input_h * input_w]; // 分配 host_inputs
   host_outputs = new float[38001];
 }
 
-detector::YoloV8::~YoloV8() {
+detector_wjr::YoloV8::~YoloV8() {
   // Free CUDA memory
   cudaFree(cuda_inputs);
   cudaFree(cuda_outputs);
@@ -26,7 +26,7 @@ detector::YoloV8::~YoloV8() {
   free(bindings);
 }
 
-int detector::YoloV8::init(std::string engine_path, std::string plugin_path) {
+int detector_wjr::YoloV8::init(std::string engine_path, std::string plugin_path) {
 #ifndef PLUGIN_REGIST
 #define PLUGIN_REGIST
   void *handle = dlopen(plugin_path.c_str(), RTLD_LAZY);
@@ -76,7 +76,7 @@ int detector::YoloV8::init(std::string engine_path, std::string plugin_path) {
 std::tuple<std::vector<cv::Mat>, double, std::vector<std::vector<float>>,
            std::vector<std::vector<float>>, std::vector<std::vector<int>>,
            std::vector<std::vector<float>>>
-detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator, bool flag) {
+detector_wjr::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator, bool flag) {
   // Prepare batch
   std::vector<cv::Mat> batch_image_raw = {};
   std::vector<int> batch_origin_h = {};
@@ -143,7 +143,7 @@ detector::YoloV8::infer(std::vector<cv::Mat> &raw_image_generator, bool flag) {
                          result_scores, result_classID, det);
 }
 
-cv::Mat detector::YoloV8::preprocess_image(const cv::Mat &raw_bgr_image) {
+cv::Mat detector_wjr::YoloV8::preprocess_image(const cv::Mat &raw_bgr_image) {
   cv::Mat image_raw = raw_bgr_image.clone();
   int h = image_raw.rows;
   int w = image_raw.cols;
@@ -199,7 +199,7 @@ cv::Mat detector::YoloV8::preprocess_image(const cv::Mat &raw_bgr_image) {
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
-detector::YoloV8::non_max_suppression(std::vector<float> &boxes,
+detector_wjr::YoloV8::non_max_suppression(std::vector<float> &boxes,
                                       std::vector<float> scores,
                                       std::vector<int> classID, float threshold,
                                       bool flag = true) {
@@ -244,7 +244,7 @@ detector::YoloV8::non_max_suppression(std::vector<float> &boxes,
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
-detector::YoloV8::post_process(float *output, int origin_w, int origin_h,
+detector_wjr::YoloV8::post_process(float *output, int origin_w, int origin_h,
                                int output_size, bool flag) {
   std::vector<float> boxes = {};
   std::vector<float> scores = {};
@@ -294,11 +294,11 @@ detector::YoloV8::post_process(float *output, int origin_w, int origin_h,
   }
   std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
       nms_result =
-          detector::YoloV8::non_max_suppression(boxes, scores, classID, 0.3);
+          detector_wjr::YoloV8::non_max_suppression(boxes, scores, classID, 0.3);
   return nms_result;
 }
 
-cv::Rect detector::YoloV8::clip_box(const cv::Rect &box, int origin_h,
+cv::Rect detector_wjr::YoloV8::clip_box(const cv::Rect &box, int origin_h,
                                     int origin_w) {
   int x1 = std::max(0, std::min(box.x, origin_w - 1));
   int y1 = std::max(0, std::min(box.y, origin_h - 1));
@@ -309,7 +309,7 @@ cv::Rect detector::YoloV8::clip_box(const cv::Rect &box, int origin_h,
 }
 
 // 辅助函数：计算两个矩形的IoU
-float detector::YoloV8::bbox_iou(const cv::Rect &box1, const cv::Rect &box2) {
+float detector_wjr::YoloV8::bbox_iou(const cv::Rect &box1, const cv::Rect &box2) {
   int x1 = std::max(box1.x, box2.x);
   int y1 = std::max(box1.y, box2.y);
   int x2 = std::min(box1.x + box1.width, box2.x + box2.width);

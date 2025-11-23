@@ -12,10 +12,10 @@ detector_node::detector_node(const rclcpp::NodeOptions &options)
       "plugin_path", "/home/phoenix/tensorrtx/yolov8/build/libmyplugins.so");
 #endif
 #ifdef USING_LW_DETR
-  this->declare_parameter("model_path", "/home/ma/inference_model.engine");
+  this->declare_parameter("model_path",
+                          "/home/ma/roboarm/LW-DETR/output/lwdetr_medium_coco/inference_model.engine");
   this->declare_parameter("plugin_path",
-                          "/home/phoenix/roboarm/FairinoDualArm/src/detector/"
-                          "asserts/layernorm_plugin.so");
+                          "/home/ma/roboarm/LW-DETR/output/lwdetr_medium_coco/inference_model.engine");
 #endif
   this->declare_parameter("confidence_threshold", 0.5);
   this->declare_parameter("image_topic", "/camera/color/image_raw");

@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-namespace detector {
+namespace detector_wjr {
 
 struct InferContext {
   nvinfer1::IExecutionContext *context;

@@ -15,7 +15,7 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <bits/stl_numeric.h>
 
-namespace detector {
+namespace detector_wjr {
 
 // Define YoloV8
 class YoloV8 {
