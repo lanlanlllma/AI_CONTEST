@@ -212,8 +212,7 @@ detector::detector_node::detector_node(const rclcpp::NodeOptions &options)
       std::bind(&detector_node::image_callback, this, std::placeholders::_1));
 
   //发布图像
-  cars_with_armor_pub =
-      this->create_publisher<msg::Cars>(detections_topic, 10);
+  cars_with_armor_pub = this->create_publisher<msg::Cars>(detections_topic, 10);
   img_car_pub_ =
       this->create_publisher<sensor_msgs::msg::Image>(image_car_topic, 10);
 
@@ -308,8 +307,8 @@ void detector::detector_node::image_callback(
 
   // 准备消息
   auto Cars = msg::Cars(); // cars消息=car数组( xyxy +
-                                             // armor(id+score+xyxy) + is_empty
-                                             // )  +  header  +  is_empty
+                           // armor(id+score+xyxy) + is_empty
+                           // )  +  header  +  is_empty
   Cars.cars.clear();
   if (rosbag_flag_) {
     Cars.header.stamp = this->now();
@@ -788,7 +787,19 @@ detector::detector_node::post_precess(std::vector<std::vector<float>> boxes,
     return {};
   }
 
-  return std::make_tuple(precessed_boxes, precessed_score, precessed_classID);
+  std::vector<float> valid_boxes, valid_scores;
+  std::vector<int> valid_classID;
+
+  for (size_t i = 0; i < precessed_classID.size(); ++i) {
+    if (precessed_classID[i] == 0) {
+      valid_boxes.insert(valid_boxes.end(), precessed_boxes.begin() + i * 4,
+                         precessed_boxes.begin() + (i + 1) * 4);
+      valid_scores.push_back(precessed_score[i]);
+      valid_classID.push_back(precessed_classID[i]);
+    }
+  }
+
+  return std::make_tuple(valid_boxes, valid_scores, valid_classID);
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
