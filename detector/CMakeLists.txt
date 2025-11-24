@@ -28,17 +28,15 @@ find_package(rosidl_default_generators REQUIRED)
 
 
 # 设置 TensorRT 相关路径
-set(TENSORRT_DIR /home/ma/Downloads/TensorRT-10.8.0.43)
-set(TENSORRT_PLUGIN_LIB "" CACHE FILEPATH "Path to a custom TensorRT plugin library (optional)")
-
-if(NOT TENSORRT_PLUGIN_LIB AND DEFINED ENV{TENSORRT_PLUGIN_LIB})
-  set(TENSORRT_PLUGIN_LIB $ENV{TENSORRT_PLUGIN_LIB})
-endif()
+set(TENSORRT_DIR /home/phoenix/TensorRT-8.6.1.6)
 
 # 添加消息定义 - 将消息生成目标改为${PROJECT_NAME}，与代码中使用的命名空间一致
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Bbox2d.msg"
   "msg/Bbox2dArray.msg"
+  "msg/Car.msg"
+  "msg/Cars.msg"
+  "msg/Armor.msg"
   DEPENDENCIES
   sensor_msgs
   std_msgs
@@ -76,26 +74,16 @@ ament_target_dependencies(detector_lib
 )
 
 # 链接外部库和消息接口
-set(detector_link_libraries
+target_link_libraries(detector_lib
   ${OpenCV_LIBS}
   ${CUDA_LIBRARIES}
   nvinfer
   nvinfer_plugin
   nvonnxparser
-  ${CUDA_CUDART_LIBRARY}
-  dl
+  cudart
+  /home/phoenix/tensorrtx/yolov8/build/libmyplugins.so
   "${cpp_typesupport_target}"
 )
-
-if(TENSORRT_PLUGIN_LIB)
-  if(EXISTS "${TENSORRT_PLUGIN_LIB}")
-    list(APPEND detector_link_libraries "${TENSORRT_PLUGIN_LIB}")
-  else()
-    message(WARNING "Requested TensorRT plugin library '${TENSORRT_PLUGIN_LIB}' was not found; continuing without it")
-  endif()
-endif()
-
-target_link_libraries(detector_lib ${detector_link_libraries})
 
 # 注册组件
 rclcpp_components_register_node(detector_lib
