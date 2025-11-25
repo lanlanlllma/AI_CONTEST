@@ -1,8 +1,0 @@
-<?xml version="1.0"?>
-<library path="lib/libdetector.so">
-  <class name="detector_wjr::DetectorNode" base_class_type="rclcpp::Node">
-    <description>
-      Detector Node
-    </description>
-  </class>
-</library>
