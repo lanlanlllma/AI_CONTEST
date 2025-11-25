@@ -25,18 +25,36 @@ find_package(OpenCV REQUIRED)
 find_package(CUDA REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
+# 设置 CUDA 路径
+if(NOT DEFINED CUDA_TOOLKIT_ROOT_DIR OR NOT EXISTS "${CUDA_TOOLKIT_ROOT_DIR}")
+  set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda" CACHE PATH "CUDA toolkit root directory")
+  # 尝试查找已安装的 CUDA 版本
+  file(GLOB CUDA_VERSIONS LIST_DIRECTORIES true "/usr/local/cuda-*")
+  if(CUDA_VERSIONS)
+    list(GET CUDA_VERSIONS 0 CUDA_TOOLKIT_ROOT_DIR)
+  endif()
+endif()
 
+# 添加 CUDA 库路径
+if(EXISTS "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
+  link_directories("${CUDA_TOOLKIT_ROOT_DIR}/lib64")
+  set(CUDA_LIB_DIR "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
+elseif(EXISTS "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib")
+  link_directories("${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib")
+  set(CUDA_LIB_DIR "${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib")
+endif()
+
+message(STATUS "CUDA Toolkit: ${CUDA_TOOLKIT_ROOT_DIR}")
+message(STATUS "CUDA Library Dir: ${CUDA_LIB_DIR}")
 
 # 设置 TensorRT 相关路径
-set(TENSORRT_DIR /home/phoenix/TensorRT-8.6.1.6)
+set(TENSORRT_DIR /home/ma/Downloads/TensorRT-8.6.1.6)
+link_directories(${TENSORRT_DIR}/lib)
 
 # 添加消息定义 - 将消息生成目标改为${PROJECT_NAME}，与代码中使用的命名空间一致
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Bbox2d.msg"
   "msg/Bbox2dArray.msg"
-  "msg/Car.msg"
-  "msg/Cars.msg"
-  "msg/Armor.msg"
   DEPENDENCIES
   sensor_msgs
   std_msgs
@@ -81,7 +99,7 @@ target_link_libraries(detector_lib
   nvinfer_plugin
   nvonnxparser
   cudart
-  /home/phoenix/tensorrtx/yolov8/build/libmyplugins.so
+  # /home/phoenix/tensorrtx/yolov8/build/libmyplugins.so
   "${cpp_typesupport_target}"
 )
 
