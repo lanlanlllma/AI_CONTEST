@@ -16,6 +16,12 @@ def generate_launch_description():
         default_value='true',
         description='Enable debug output'
     )
+    
+    default_slave_id_arg = DeclareLaunchArgument(
+        'default_slave_id',
+        default_value='10',
+        description='Default Modbus slave ID (十进制 10 = 十六进制 0x0A)'
+    )
 
     # 创建节点
     gripper_node = Node(
@@ -25,6 +31,7 @@ def generate_launch_description():
         parameters=[{
             'port': LaunchConfiguration('port'),
             'debug': LaunchConfiguration('debug'),
+            'default_slave_id': LaunchConfiguration('default_slave_id'),
         }],
         output='screen'
     )
@@ -33,5 +40,6 @@ def generate_launch_description():
     return LaunchDescription([
         port_arg,
         debug_arg,
+        default_slave_id_arg,
         gripper_node
     ])

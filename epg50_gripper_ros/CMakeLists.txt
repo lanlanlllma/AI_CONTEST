@@ -54,9 +54,13 @@ target_link_libraries(epg50_gripper_node
   ${cpp_typesupport_target}
 )
 
+# 添加 Slave ID 扫描工具
+add_executable(scan_slave_id src/scan_slave_id.cpp)
+
 # 安装目标
 install(TARGETS
   epg50_gripper_node
+  scan_slave_id
   DESTINATION lib/${PROJECT_NAME})
 
 # 安装头文件

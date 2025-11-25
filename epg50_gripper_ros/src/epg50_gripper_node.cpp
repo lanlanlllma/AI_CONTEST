@@ -16,7 +16,7 @@ public:
         // 声明参数
         this->declare_parameter("port", "/dev/ttyACM0");
         this->declare_parameter("debug", false);
-        this->declare_parameter("default_slave_id", 0x09);   // 添加默认从站ID参数
+        this->declare_parameter("default_slave_id", 0x0A);   // 默认从站ID: 0x0A (十进制 10)
         this->declare_parameter("status_update_rate", 10.0); // 状态更新频率，单位Hz
         this->declare_parameter("command_timeout", 1.0);     // 命令超时时间，单位秒
 
