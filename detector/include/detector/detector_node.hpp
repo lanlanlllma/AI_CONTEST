@@ -37,6 +37,8 @@ private:
 // LwDetr推理对象
 #ifdef USING_LW_DETR
     std::unique_ptr<LwDetr> yolov8_detector_;
+    // 第二层网络：用于检测脏污的推理对象
+    std::unique_ptr<LwDetr> second_detector_;
 #endif
 
     // 发布器、订阅器
@@ -48,6 +50,7 @@ private:
     // 参数
     std::string model_path_;
     std::string plugin_path_;
+    std::string second_model_path_; // 第二层网络模型路径
     double confidence_threshold_;
     bool detect_bottle_; // true: 检测瓶子, false: 检测其他物品
 

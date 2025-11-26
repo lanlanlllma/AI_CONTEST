@@ -4,4 +4,5 @@ robot_main:
     dirty_pos: []
     clean_pos: []
     step_back_height: 100
+    desk_height: 750
     

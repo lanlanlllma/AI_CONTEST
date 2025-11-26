@@ -21,6 +21,8 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GraspResult.msg"
   "srv/GraspDetect.srv"
+  "srv/GraspDetectTrigger.srv"
+  "srv/GraspDetectTriggerMask.srv"
   DEPENDENCIES sensor_msgs
 )
 

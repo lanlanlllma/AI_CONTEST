@@ -19,6 +19,8 @@
 #include "visualization_msgs/msg/marker.hpp"
 #include "depth_handler/msg/bbox3d.hpp"
 #include "depth_handler/msg/bbox3d_array.hpp"
+#include "detector/msg/bbox2d.hpp"
+#include "detector/msg/bbox2d_array.hpp"
 #include "dualarm/kalman.h"
 
 #include <tf2_ros/transform_listener.h>
@@ -29,26 +31,82 @@
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <deque>
+#include <map>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
 struct object_detection {
-    int id;                       // 物体ID
-    std::vector<double> position; // 物体位置
-    int age         = 0;          // 物体检测年龄，初始为0
+    int id;                       // 当前物体ID（稳定后的类别）
+    std::vector<double> position; // 物体位置（X, Y, 通常不需要Z）
+    int age         = 0;          // 物体检测年龄（帧数），初始为0
     int valid_count = 0;          // 有效检测次数，初始为0
-    bool is_valid() const {
-        // 有效检测次数超过3次且年龄小于5次则认为是有效
-        return valid_count >= 1 && age < 5;
+
+    // 类别跳变检测：记录最近N帧的类别历史
+    static constexpr int HISTORY_SIZE = 10; // 记录最近10帧
+    std::deque<int> class_history;          // 类别历史队列
+
+    // 添加新的类别观测
+    void add_class_observation(int class_id) {
+        class_history.push_back(class_id);
+        if (class_history.size() > HISTORY_SIZE) {
+            class_history.pop_front();
+        }
     }
+
+    // 获取稳定的类别ID（多数投票）
+    int get_stable_class_id() const {
+        if (class_history.empty())
+            return id;
+
+        // 统计各类别出现次数
+        std::map<int, int> class_counts;
+        for (int cls: class_history) {
+            class_counts[cls]++;
+        }
+
+        // 找到出现次数最多的类别
+        int max_count = 0;
+        int stable_id = id;
+        for (const auto& pair: class_counts) {
+            if (pair.second > max_count) {
+                max_count = pair.second;
+                stable_id = pair.first;
+            }
+        }
+        return stable_id;
+    }
+
+    // 判断类别是否稳定（最近N帧中至少有X%一致）
+    bool is_class_stable(double threshold = 0.6) const {
+        if (class_history.size() < 5)
+            return false; // 至少需要5帧数据
+
+        int stable_id    = get_stable_class_id();
+        int stable_count = 0;
+        for (int cls: class_history) {
+            if (cls == stable_id)
+                stable_count++;
+        }
+
+        return static_cast<double>(stable_count) / class_history.size() >= threshold;
+    }
+
+    bool is_valid() const {
+        // 需要类别稳定且有足够的有效检测次数，年龄不能太大
+        return valid_count >= 3 && age < 5 && is_class_stable();
+    }
+
     bool is_invalid() const {
-        // 有效检测次数小于等于3次或年龄大于等于5则认为是无效
+        // 有效检测次数太少或年龄太大则认为无效
         return valid_count <= 1 || age >= 20;
     }
+
     bool operator==(const object_detection& other) const {
         return id == other.id;
     }
+
     bool operator!=(const object_detection& other) const {
         return !(*this == other);
     }
@@ -97,7 +155,7 @@ class RobotMain: public rclcpp::Node {
 public:
     explicit RobotMain(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
     virtual ~RobotMain();
-    void handleObjDetection(const depth_handler::msg::Bbox3dArray::SharedPtr bbox3d_array_msg);
+    void handleObjDetection(const detector::msg::Bbox2dArray::SharedPtr bbox2d_array_msg);
     std::vector<double> calculateTcpToObjectIncrement(const std::vector<double>& object_position);
 
     // 线程安全的访问函数
@@ -133,7 +191,7 @@ public:
     // subscribers
     rclcpp::Subscription<robo_ctrl::msg::RobotState>::SharedPtr L_robot_state_sub_;
     rclcpp::Subscription<epg50_gripper_ros::msg::GripperStatus>::SharedPtr L_gripper_status_sub_;
-    rclcpp::Subscription<depth_handler::msg::Bbox3dArray>::SharedPtr L_bbox3d_array_sub_;
+    rclcpp::Subscription<detector::msg::Bbox2dArray>::SharedPtr L_bbox2d_array_sub_;
 
     // clients
     rclcpp::Client<robo_ctrl::srv::RobotServoLine>::SharedPtr L_robot_servo_line_client_;
@@ -179,8 +237,8 @@ public:
 
     // 物体检测控制参数
     bool enable_object_update_ = true; // 遮断开关：控制是否更新物体位置
-    int age_threshold_         = 5;    // 年龄阈值：超过此值的物体将被移除
-    double distance_threshold_ = 0.15; // 距离阈值：15cm内认为是同一物体
+    int age_threshold_         = 10;   // 年龄阈值：超过此值的物体将被移除
+    double distance_threshold_ = 0.10; // 二维平面距离阈值：10cm内(仅X-Y)认为是同一物体
 
     std::vector<double> CAP_OPEN_JOINTS_L         = { -55, -90, -120, 30, 81.272, 0 };
     std::vector<double> CAP_OPEN_JOINTS_R         = { 49.94319534301758,  -112.81088256835938, 124.09851837158203,

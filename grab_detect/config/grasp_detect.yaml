@@ -7,8 +7,8 @@ grasp_detect_node:
     
     # 话题配置
     trigger_topic: "/grasp_detect/trigger"  # 监听的触发话题
-    color_image_topic: "/color/image_raw"
-    depth_image_topic: "/depth/image_raw"
+    color_image_topic: "/camera/color/image_raw"
+    depth_image_topic: "/camera/depth/image_raw"
     mask_image_topic: ""  # 可选，留空则不使用mask
     
     # 服务配置

@@ -35,6 +35,29 @@ string message                    # 返回消息或错误描述
 GraspResult[] grasps              # 抓取结果数组
 ```
 
+### GraspDetectTrigger.srv
+```
+# 请求（空，使用最新订阅的图像）
+---
+# 响应
+bool success                      # 检测是否成功
+int32 num_grasps                  # 检测到的抓取数量
+string message                    # 返回消息或错误描述
+GraspResult[] grasps              # 抓取结果数组
+```
+
+### GraspDetectTriggerMask.srv
+```
+# 请求（仅传入 mask，color 和 depth 使用最新订阅的图像）
+sensor_msgs/Image mask_image      # 掩码图像
+---
+# 响应
+bool success                      # 检测是否成功
+int32 num_grasps                  # 检测到的抓取数量
+string message                    # 返回消息或错误描述
+GraspResult[] grasps              # 抓取结果数组
+```
+
 ## 编译
 
 ```bash
@@ -90,6 +113,129 @@ ros2 topic pub --once /grasp_detect/trigger std_msgs/msg/Empty
 节点会使用最新接收到的图像进行检测，结果会打印在终端。
 
 ### 3. 服务调用模式
+
+#### 3.1 直接传图像（GraspDetect）
+
+使用命令行（需要准备图像数据）：
+```bash
+ros2 service call /grasp_detect grab_detect/srv/GraspDetect \
+  "{color_image: {...}, depth_image: {...}, mask_image: {...}}"
+```
+
+#### 3.2 触发式调用（GraspDetectTrigger）
+
+使用最新订阅的图像进行检测：
+```bash
+ros2 service call /grasp_detect_trigger grab_detect/srv/GraspDetectTrigger
+```
+
+#### 3.3 触发式调用 + 自定义 Mask（GraspDetectTriggerMask）
+
+使用最新订阅的 color/depth 图像 + 自定义 mask：
+```bash
+ros2 service call /grasp_detect_trigger_mask grab_detect/srv/GraspDetectTriggerMask \
+  "{mask_image: {...}}"
+```
+
+Python 客户端示例：
+```python
+import rclpy
+from rclpy.node import Node
+from grab_detect.srv import GraspDetectTriggerMask
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+
+class GraspTriggerMaskClient(Node):
+    def __init__(self):
+        super().__init__('grasp_trigger_mask_client')
+        self.client = self.create_client(GraspDetectTriggerMask, 'grasp_detect_trigger_mask')
+        self.bridge = CvBridge()
+        
+    def call_service(self, mask_image_array):
+        request = GraspDetectTriggerMask.Request()
+        
+        # 转换 mask 图像（假设是 numpy 数组）
+        request.mask_image = self.bridge.cv2_to_imgmsg(mask_image_array, "mono8")
+        
+        # 等待服务可用
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('等待服务...')
+        
+        # 调用服务
+        future = self.client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        
+        response = future.result()
+        if response.success:
+            print(f"检测成功！找到 {response.num_grasps} 个抓取点")
+            for i, grasp in enumerate(response.grasps[:5]):
+                print(f"抓取 {i+1}: score={grasp.score:.4f}, "
+                      f"pos={grasp.translation}")
+        else:
+            print(f"检测失败: {response.message}")
+        
+        return response
+
+# 使用
+rclpy.init()
+client = GraspTriggerMaskClient()
+# 创建一个示例 mask (例如从检测结果生成)
+mask = np.zeros((720, 1280), dtype=np.uint8)
+mask[100:200, 100:200] = 255  # 感兴趣区域
+result = client.call_service(mask)
+```
+
+#### 3.4 直接传图像的 Python 示例（GraspDetect）
+```python
+import rclpy
+from rclpy.node import Node
+from grab_detect.srv import GraspDetectTrigger
+
+class GraspTriggerClient(Node):
+    def __init__(self):
+        super().__init__('grasp_trigger_client')
+        self.client = self.create_client(GraspDetectTrigger, 'grasp_detect_trigger')
+        
+    def call_service(self):
+        request = GraspDetectTrigger.Request()
+        
+        # 等待服务可用
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('等待服务...')
+        
+        # 调用服务
+        future = self.client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        
+        response = future.result()
+        if response.success:
+            print(f"检测成功！找到 {response.num_grasps} 个抓取点")
+            for i, grasp in enumerate(response.grasps[:5]):
+                print(f"抓取 {i+1}: score={grasp.score:.4f}, "
+                      f"pos={grasp.translation}")
+        else:
+            print(f"检测失败: {response.message}")
+        
+        return response
+
+# 使用
+rclpy.init()
+client = GraspTriggerClient()
+result = client.call_service()
+```
+
+### 4. 服务对比
+
+| 服务类型 | 请求参数 | 返回值 | 使用场景 |
+|---------|---------|---------|----------|
+| 话题触发 (`/grasp_detect/trigger`) | 无 | 无（仅打印） | 简单测试 |
+| GraspDetectTrigger | 无 | 完整抓取结果 | 使用最新图像，需要结果 |
+| GraspDetectTriggerMask | 仅 mask 图像 | 完整抓取结果 | 自定义感兴趣区域 |
+| GraspDetect | 3个图像（color/depth/mask） | 完整抓取结果 | 传入特定图像 |
+
+#### 3.4 直接传图像的 Python 示例（GraspDetect）
 
 使用命令行（需要准备图像数据）：
 ```bash

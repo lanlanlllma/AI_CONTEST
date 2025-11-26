@@ -14,8 +14,9 @@ detector_node::detector_node(const rclcpp::NodeOptions& options): Node("detector
         "plugin_path",
         "/home/phoenix/roboarm/FairinoDualArm/src/detector/asserts/layernorm_plugin.so"
     );
+    this->declare_parameter("second_model_path", "/home/ma/roboarm/aicontest/src/models/inference_model_dirty.engine");
 #endif
-    this->declare_parameter("confidence_threshold", 0.5);
+    this->declare_parameter("confidence_threshold", 0.1);
     this->declare_parameter("image_topic", "/camera/color/image_raw");
     this->declare_parameter("detections_topic", "/detector/detections");
 
@@ -26,6 +27,9 @@ detector_node::detector_node(const rclcpp::NodeOptions& options): Node("detector
     std::string image_topic = this->get_parameter("image_topic").as_string();
     ;
     std::string detections_topic = this->get_parameter("detections_topic").as_string();
+#ifdef USING_LW_DETR
+    second_model_path_ = this->get_parameter("second_model_path").as_string();
+#endif
 
 // 初始化YOLOv8推理对象
 #ifdef USING_YOLOV8
@@ -45,6 +49,15 @@ detector_node::detector_node(const rclcpp::NodeOptions& options): Node("detector
         throw std::runtime_error("LwDetr初始化失败");
     }
     RCLCPP_INFO(this->get_logger(), "LwDetr初始化成功，模型路径: %s", model_path_.c_str());
+    
+    // 初始化第二层网络
+    second_detector_ = std::make_unique<LwDetr>();
+    int ret2 = second_detector_->init(second_model_path_);
+    if (ret2 != 0) {
+        RCLCPP_ERROR(this->get_logger(), "第二层LwDetr初始化失败，错误码: %d", ret2);
+        throw std::runtime_error("第二层LwDetr初始化失败");
+    }
+    RCLCPP_INFO(this->get_logger(), "第二层LwDetr初始化成功，模型路径: %s", second_model_path_.c_str());
 #endif
 
     // 创建发布器和订阅器
@@ -105,6 +118,8 @@ void detector_node::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
             };
 
             std::vector<DetectionInfo> all_detections;
+            std::vector<DetectionInfo> class0_detections; // 存储class_id=0的检测框，用于第二层推理
+            
             for (size_t i = 0; i < img_boxes.size() / 4; ++i) {
                 // 检查置信度阈值
                 if (img_scores[i] < confidence_threshold_) {
@@ -121,47 +136,136 @@ void detector_node::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
                 det.index    = i;
 
                 all_detections.push_back(det);
+                
+                // 收集class_id=0的框用于第二层推理
+                if (det.class_id == 0) {
+                    class0_detections.push_back(det);
+                }
             }
 
-            // 第二步：判断包含关系并修改class_id
-            // 用于记录class_id=0的框是否包含class_id=1的框
-            std::map<size_t, bool> class0_contains_class1;
-            std::set<size_t> class1_inside_class0;
+            // 第二步：对class_id=0的框进行第二层推理
+            std::vector<DetectionInfo> second_layer_detections;
+            if (!class0_detections.empty()) {
+                RCLCPP_INFO(this->get_logger(), "开始第二层推理，共%zu个class_id=0的框", class0_detections.size());
+                
+                for (const auto& det : class0_detections) {
+                    // 裁剪ROI区域，加入边界检查
+                    int x1 = std::max(0, static_cast<int>(det.xmin));
+                    int y1 = std::max(0, static_cast<int>(det.ymin));
+                    int x2 = std::min(image.cols, static_cast<int>(det.xmax));
+                    int y2 = std::min(image.rows, static_cast<int>(det.ymax));
+                    
+                    if (x2 <= x1 || y2 <= y1) {
+                        RCLCPP_WARN(this->get_logger(), "无效的ROI区域，跳过");
+                        continue;
+                    }
+                    
+                    cv::Mat roi = image(cv::Rect(x1, y1, x2 - x1, y2 - y1));
+                    
+                    // 准备第二层输入
+                    std::vector<cv::Mat> second_input_images;
+                    second_input_images.push_back(roi);
+                    
+                    // 执行第二层推理
+                    auto [second_processed, second_time, second_boxes, second_scores, second_class_ids, second_extra] =
+                        second_detector_->infer(second_input_images);
+                    
+                    // 处理第二层结果
+                    if (!second_boxes.empty() && !second_boxes[0].empty()) {
+                        const auto& second_img_boxes = second_boxes[0];
+                        const auto& second_img_scores = second_scores[0];
+                        const auto& second_img_class_ids = second_class_ids[0];
+                        
+                        for (size_t j = 0; j < second_img_boxes.size() / 4; ++j) {
+                            if (second_img_scores[j] < confidence_threshold_) {
+                                continue;
+                            }
+                            
+                            // 只保留第二层class_id=0的结果
+                            if (second_img_class_ids[j] == 0) {
+                                DetectionInfo second_det;
+                                // 将第二层的坐标转换回原图坐标
+                                second_det.xmin = second_img_boxes[j * 4] + x1;
+                                second_det.ymin = second_img_boxes[j * 4 + 1] + y1;
+                                second_det.xmax = second_img_boxes[j * 4 + 2] + x1;
+                                second_det.ymax = second_img_boxes[j * 4 + 3] + y1;
+                                second_det.class_id = 1; // 第二层的class_id=0对应最终的class_id=1
+                                second_det.score = second_img_scores[j];
+                                second_det.index = all_detections.size() + second_layer_detections.size();
+                                
+                                second_layer_detections.push_back(second_det);
+                                RCLCPP_INFO(
+                                    this->get_logger(),
+                                    "第二层检测到脏污: 置信度: %.2f, 边界框: [%.2f, %.2f, %.2f, %.2f]",
+                                    second_det.score,
+                                    second_det.xmin,
+                                    second_det.ymin,
+                                    second_det.xmax,
+                                    second_det.ymax
+                                );
+                            }
+                        }
+                    }
+                }
+                
+                RCLCPP_INFO(this->get_logger(), "第二层推理完成，检测到%zu个脏污区域", second_layer_detections.size());
+            }
 
-            // Lambda函数：判断框2是否在框1内部
+            // 第三步：将第二层检测结果(class_id=0)与第一层class_id=1合并
+            // 这些合并后的结果用于判断第一层class_id=0的框是否应该被标记为脏污
+            std::vector<DetectionInfo> merged_dirty_detections;
+            
+            // 添加第一层的class_id=1
+            for (const auto& det : all_detections) {
+                if (det.class_id == 1) {
+                    merged_dirty_detections.push_back(det);
+                }
+            }
+            
+            // 添加第二层的class_id=0（已转换为原图坐标，class_id已标记为1）
+            merged_dirty_detections.insert(merged_dirty_detections.end(), 
+                                          second_layer_detections.begin(), 
+                                          second_layer_detections.end());
+            
+            RCLCPP_INFO(this->get_logger(), "合并后共有%zu个脏污检测框", merged_dirty_detections.size());
+
+            // 第四步：判断第一层class_id=0的框是否包含合并后的脏污检测
+            // 用于记录class_id=0的框索引是否包含脏污
+            std::map<size_t, bool> class0_contains_dirty;
+
+            // Lambda函数：判断框2是否在框1内部（带容差）
             auto is_inside = [](const DetectionInfo& inner, const DetectionInfo& outer) -> bool {
-                return inner.xmin >= outer.xmin && inner.xmax <= outer.xmax && inner.ymin >= outer.ymin
-                    && inner.ymax <= outer.ymax;
+                return inner.xmin >= outer.xmin-40 && inner.xmax <= outer.xmax+40 && 
+                       inner.ymin >= outer.ymin-40 && inner.ymax <= outer.ymax+40;
             };
 
-            // 检查每个class_id=1的框是否在某个class_id=0的框内
+            // 检查每个合并后的脏污框是否在某个第一层class_id=0的框内
             for (size_t i = 0; i < all_detections.size(); ++i) {
-                if (all_detections[i].class_id == 1) {
-                    for (size_t j = 0; j < all_detections.size(); ++j) {
-                        if (all_detections[j].class_id == 0) {
-                            if (is_inside(all_detections[i], all_detections[j])) {
-                                class0_contains_class1[j] = true;
-                                class1_inside_class0.insert(i);
-                                break; // 找到一个包含它的class_id=0的框就够了
-                            }
+                if (all_detections[i].class_id == 0) {
+                    for (const auto& dirty_det : merged_dirty_detections) {
+                        if (is_inside(dirty_det, all_detections[i])) {
+                            class0_contains_dirty[i] = true;
+                            RCLCPP_INFO(
+                                this->get_logger(),
+                                "第一层class_id=0框[%.2f, %.2f, %.2f, %.2f]包含脏污，将被标记为class_id=1",
+                                all_detections[i].xmin,
+                                all_detections[i].ymin,
+                                all_detections[i].xmax,
+                                all_detections[i].ymax
+                            );
+                            break; // 只要包含一个脏污就够了
                         }
                     }
                 }
             }
 
-            // 第三步：根据规则添加检测框到结果消息和可视化
+            // 第五步：构建最终输出
+            // 只输出第一层的class_id=0框（根据是否包含脏污更新其class_id）
             for (size_t i = 0; i < all_detections.size(); ++i) {
                 const auto& det = all_detections[i];
-
-                // 规则1：class_id=1但不在任何class_id=0框内的，忽略
-                if (det.class_id == 1 && class1_inside_class0.find(i) == class1_inside_class0.end()) {
-                    RCLCPP_DEBUG(this->get_logger(), "忽略不在class_id=0框内的class_id=1框");
-                    continue;
-                }
-
-                // 规则2：class_id=1在class_id=0框内的，也忽略（因为已经标记了外层框）
-                if (det.class_id == 1) {
-                    RCLCPP_DEBUG(this->get_logger(), "忽略在class_id=0框内的class_id=1框");
+                
+                // 只处理第一层检测的框（不包括第二层生成的框）
+                if (det.class_id != 0) {
                     continue;
                 }
 
@@ -175,12 +279,12 @@ void detector_node::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
                 bbox.height = det.ymax - det.ymin;
                 bbox.score  = det.score;
 
-                // 规则3：class_id=0且包含class_id=1的框，改为class_id=1
-                if (det.class_id == 0 && class0_contains_class1[i]) {
+                // 如果这个class_id=0的框包含脏污，将其class_id改为1
+                if (class0_contains_dirty[i]) {
                     bbox.class_id = 1;
                     RCLCPP_INFO(
                         this->get_logger(),
-                        "检测到包含class_id=1的class_id=0框，修改为class_id=1: 置信度: %.2f, 边界框: [%.2f, %.2f, %.2f, %.2f]",
+                        "输出目标（包含脏污）: 类别ID: 1, 置信度: %.2f, 边界框: [%.2f, %.2f, %.2f, %.2f]",
                         det.score,
                         det.xmin,
                         det.ymin,
@@ -188,11 +292,10 @@ void detector_node::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
                         det.ymax
                     );
                 } else {
-                    bbox.class_id = det.class_id;
+                    bbox.class_id = 0;
                     RCLCPP_INFO(
                         this->get_logger(),
-                        "检测到目标: 类别ID: %d, 置信度: %.2f, 边界框: [%.2f, %.2f, %.2f, %.2f]",
-                        det.class_id,
+                        "输出目标（无脏污）: 类别ID: 0, 置信度: %.2f, 边界框: [%.2f, %.2f, %.2f, %.2f]",
                         det.score,
                         det.xmin,
                         det.ymin,

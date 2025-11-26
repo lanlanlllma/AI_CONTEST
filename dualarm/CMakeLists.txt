@@ -21,6 +21,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(depth_handler REQUIRED)
+find_package(detector REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 include_directories(include)
@@ -43,6 +44,7 @@ ament_target_dependencies(dualarm_node
   tf2_geometry_msgs
   visualization_msgs
   depth_handler
+  detector
 )
 
 # 创建 robot_main 可执行文件
@@ -60,6 +62,7 @@ ament_target_dependencies(robot_main
   tf2_geometry_msgs
   visualization_msgs
   depth_handler
+  detector
 )
 
 # 创建卡尔曼滤波器示例程序
@@ -81,6 +84,7 @@ ament_target_dependencies(robot_main_refactored
   tf2_geometry_msgs
   visualization_msgs
   depth_handler
+  detector
 )
 
 install(TARGETS dualarm_node robot_main kalman_example robot_main_refactored

@@ -98,8 +98,8 @@ RobotMain::RobotMain(const rclcpp::NodeOptions& options): Node("robot_main", opt
     rclcpp::SubscriptionOptions sub_options;
     sub_options.callback_group = obj_detect_cb_group_;
 
-    L_bbox3d_array_sub_ = this->create_subscription<depth_handler::msg::Bbox3dArray>(
-        "depth_handler/bbox3d",
+    L_bbox2d_array_sub_ = this->create_subscription<detector::msg::Bbox2dArray>(
+        "/detector/detections",
         10,
         std::bind(&RobotMain::handleObjDetection, this, std::placeholders::_1),
         sub_options
@@ -114,7 +114,6 @@ RobotMain::RobotMain(const rclcpp::NodeOptions& options): Node("robot_main", opt
     L_robot_set_speed_client_  = this->create_client<robo_ctrl::srv::RobotSetSpeed>(ROBOT_L + "/robot_set_speed");
     L_robot_act_j_client_      = this->create_client<robo_ctrl::srv::RobotActJ>(ROBOT_L + "/robot_act_j");
     gripper_command_client_    = this->create_client<epg50_gripper_ros::srv::GripperCommand>("/epg50_gripper/command");
-
 
     this->declare_parameter("init_tcp_pose", std::vector<double> { 168.0, -102.0, 394.0, -111.556, 0.0, -90.0 });
     this->declare_parameter("open_cap_joint_pose", std::vector<double> { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 });
@@ -173,13 +172,10 @@ std::vector<double> RobotMain::calculateTcpToObjectIncrement(const std::vector<d
     return increment;
 }
 
-void RobotMain::handleObjDetection(const depth_handler::msg::Bbox3dArray::SharedPtr bbox3d_array_msg) {
-    // 遮断开关 - 控制是否更新物体位置
-    std::async(std::launch::async, [this, bbox3d_array_msg]() {
-        // 等待1秒，确保其他订阅者有时间处理
-        // std::this_thread::sleep_for(std::chrono::seconds(1));
-
-        // 检查更新开关状态（使用线程安全的方法）
+void RobotMain::handleObjDetection(const detector::msg::Bbox2dArray::SharedPtr bbox2d_array_msg) {
+    // 异步处理避免阻塞
+    std::async(std::launch::async, [this, bbox2d_array_msg]() {
+        // 检查更新开关状态
         if (!isObjectUpdateEnabled()) {
             RCLCPP_DEBUG(this->get_logger(), "Object detection update is disabled");
             return;
@@ -193,58 +189,97 @@ void RobotMain::handleObjDetection(const depth_handler::msg::Bbox3dArray::Shared
             obj.age++;
         }
 
-        // 处理检测到的物体
-        for (const auto& bbox3d: bbox3d_array_msg->results) {
-            // 处理3D边界框
-            RCLCPP_INFO(this->get_logger(), "Received bbox3d with class_id: %d", bbox3d.class_id);
+        // 处理检测到的物体（从 2D bbox 转换为位置）
+        for (const auto& bbox2d: bbox2d_array_msg->results) {
+            RCLCPP_DEBUG(
+                this->get_logger(),
+                "Received bbox2d with class_id: %d at pixel (%.1f, %.1f)",
+                bbox2d.class_id,
+                bbox2d.x,
+                bbox2d.y
+            );
+
+            // 将像素坐标转换为机器人坐标系中的位置
+            // 注意：这里需要根据相机标定参数进行转换
+            // 为简化，这里假设已经有一个 TF 转换或者直接使用像素坐标
+            // 实际应用中需要使用 TF 将 camera_frame -> base_link
+
+            // TODO: 这里需要实现从像素坐标到机器人坐标系的转换
+            // 临时使用像素坐标作为位置（单位：米）
+            // 实际中需要结合深度信息或其他方式转换
+            double x_pos = bbox2d.x / 1000.0; // 假设像素坐标需要缩放
+            double y_pos = bbox2d.y / 1000.0;
+            double z_pos = 0.0; // 2D 检测不提供 Z 信息
 
             // 提取物体信息
             object_detection new_obj;
-            new_obj.id          = bbox3d.class_id;
-            new_obj.position    = { bbox3d.x, bbox3d.y, bbox3d.z };
-            new_obj.age         = 0; // 新检测到的物体年龄为0
-            new_obj.valid_count = 1; // 初始有效计数为1
+            new_obj.id          = bbox2d.class_id;
+            new_obj.position    = { x_pos, y_pos, z_pos };
+            new_obj.age         = 0;
+            new_obj.valid_count = 1;
+            new_obj.add_class_observation(bbox2d.class_id);
 
-            // 查找是否已存在相同ID的物体
+            // 查找是否已存在相同位置的物体（仅考虑 X-Y 平面距离）
             bool found_existing = false;
+            int best_match_idx  = -1;
+            double min_distance = distance_threshold_;
 
             for (size_t i = 0; i < detected_objects_.size(); ++i) {
-                if (detected_objects_[i].id == new_obj.id) {
-                    // 计算与已存在物体的距离
-                    double distance = std::sqrt(
-                        std::pow(detected_objects_[i].position[0] - new_obj.position[0], 2)
-                        + std::pow(detected_objects_[i].position[1] - new_obj.position[1], 2)
-                        + std::pow(detected_objects_[i].position[2] - new_obj.position[2], 2)
-                    );
+                // 计算二维平面距离（仅 X-Y）
+                double distance = std::sqrt(
+                    std::pow(detected_objects_[i].position[0] - new_obj.position[0], 2)
+                    + std::pow(detected_objects_[i].position[1] - new_obj.position[1], 2)
+                );
 
-                    if (distance < distance_threshold_) {
-                        // 重置年龄，因为重新检测到了
-                        detected_objects_[i].age = 0;
-                        detected_objects_[i].valid_count++;
-
-                        // 使用卡尔曼滤波更新位置
-                        std::vector<double> filtered_position = kalman_filters_[i].filterPose(new_obj.position);
-                        detected_objects_[i].position         = filtered_position;
-                        found_existing                        = true;
-
-                        RCLCPP_INFO(
-                            this->get_logger(),
-                            "Updated object %d position: [%.3f, %.3f, %.3f], age: %d, valid_count: %d",
-                            new_obj.id,
-                            filtered_position[0],
-                            filtered_position[1],
-                            filtered_position[2],
-                            detected_objects_[i].age,
-                            detected_objects_[i].valid_count
-                        );
-                        break;
-                    }
+                // 找到距离最近且在阈值内的物体
+                if (distance < min_distance) {
+                    min_distance   = distance;
+                    best_match_idx = i;
+                    found_existing = true;
                 }
             }
 
-            // 如果是新物体，添加到列表中
-            if (!found_existing) {
-                // 创建新的卡尔曼滤波器
+            if (found_existing && best_match_idx >= 0) {
+                // 找到了匹配的物体，更新其信息
+                auto& existing_obj = detected_objects_[best_match_idx];
+
+                // 重置年龄
+                existing_obj.age = 0;
+                existing_obj.valid_count++;
+
+                // 添加类别观测
+                existing_obj.add_class_observation(bbox2d.class_id);
+
+                // 更新稳定的类别ID（基于历史投票）
+                int stable_id = existing_obj.get_stable_class_id();
+                if (stable_id != existing_obj.id) {
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "Class ID corrected from %d to %d based on history voting",
+                        existing_obj.id,
+                        stable_id
+                    );
+                    existing_obj.id = stable_id;
+                }
+
+                // 使用卡尔曼滤波更新位置
+                std::vector<double> filtered_position = kalman_filters_[best_match_idx].filterPose(new_obj.position);
+                existing_obj.position                 = filtered_position;
+
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "Updated object %d (stable_id=%d) position: [%.3f, %.3f, %.3f], age: %d, valid_count: %d, class_stable: %s",
+                    existing_obj.id,
+                    stable_id,
+                    filtered_position[0],
+                    filtered_position[1],
+                    filtered_position[2],
+                    existing_obj.age,
+                    existing_obj.valid_count,
+                    existing_obj.is_class_stable() ? "YES" : "NO"
+                );
+            } else {
+                // 新物体，添加到列表中
                 RobotKalmanFilter new_filter;
 
                 // 初始化滤波器位置
@@ -280,7 +315,6 @@ void RobotMain::handleObjDetection(const depth_handler::msg::Bbox3dArray::Shared
                 );
                 detected_objects_.erase(detected_objects_.begin() + i);
                 kalman_filters_.erase(kalman_filters_.begin() + i);
-                // 不增加i，因为元素被删除了
             } else {
                 ++i;
             }
@@ -291,10 +325,11 @@ void RobotMain::handleObjDetection(const depth_handler::msg::Bbox3dArray::Shared
         for (const auto& obj: detected_objects_) {
             RCLCPP_DEBUG(
                 this->get_logger(),
-                "Object %d: age=%d, valid_count=%d, valid=%s",
+                "Object %d: age=%d, valid_count=%d, class_stable=%s, valid=%s",
                 obj.id,
                 obj.age,
                 obj.valid_count,
+                obj.is_class_stable() ? "YES" : "NO",
                 obj.is_valid() ? "true" : "false"
             );
         }
@@ -461,11 +496,10 @@ int main(int argc, char** argv) {
     // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(3500))); // 运动时间 + 额外500ms
 
     // R_go_to_opencap_request->command_type  = 0; // ServoMoveStart
-    // R_go_to_opencap_request->target_joints = std::vector<double>({ 85.777, -156.055, 96.643, -157.912, -52.075, 30.0 });
-    // R_go_to_opencap_request->point_count   = 100;     // 100个点
-    // R_go_to_opencap_request->message_time  = 0.01;    // 0.01s/点
-    // R_go_to_opencap_request->use_incremental = false; // 使用绝对位置
-    // auto R_go_to_opencap_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    // R_go_to_opencap_request->target_joints = std::vector<double>({ 85.777, -156.055, 96.643, -157.912, -52.075, 30.0
+    // }); R_go_to_opencap_request->point_count   = 100;     // 100个点 R_go_to_opencap_request->message_time  = 0.01;
+    // // 0.01s/点 R_go_to_opencap_request->use_incremental = false; // 使用绝对位置 auto R_go_to_opencap_response =
+    // ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
     //     node->R_robot_act_j_client_,
     //     R_go_to_opencap_request,
     //     node,
@@ -884,8 +918,9 @@ int main(int argc, char** argv) {
     //     RCLCPP_INFO(node->get_logger(), "Gripper closed successfully");
 
     //     // 转瓶盖
-    //     auto circle_open_cap_response_future = node->R_robot_act_client_->async_send_request(circle_open_cap_request);
-    //     if (rclcpp::spin_until_future_complete(node, circle_open_cap_response_future)
+    //     auto circle_open_cap_response_future =
+    //     node->R_robot_act_client_->async_send_request(circle_open_cap_request); if
+    //     (rclcpp::spin_until_future_complete(node, circle_open_cap_response_future)
     //         != rclcpp::FutureReturnCode::SUCCESS) {
     //         RCLCPP_ERROR(node->get_logger(), "Failed to call service robot_act for open cap position");
     //         return 1;
@@ -1206,11 +1241,10 @@ int main(int argc, char** argv) {
     // std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 
     // R_go_to_opencap_request->command_type  = 0; // ServoMoveStart
-    // R_go_to_opencap_request->target_joints = std::vector<double>({ 85.777, -156.055, 96.643, -157.912, -52.075, 50.0 });
-    // R_go_to_opencap_request->point_count   = 100;     // 100个点
-    // R_go_to_opencap_request->message_time  = 0.01;    // 0.01s/点
-    // R_go_to_opencap_request->use_incremental = false; // 使用绝对位置
-    // R_go_to_opencap_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    // R_go_to_opencap_request->target_joints = std::vector<double>({ 85.777, -156.055, 96.643, -157.912, -52.075, 50.0
+    // }); R_go_to_opencap_request->point_count   = 100;     // 100个点 R_go_to_opencap_request->message_time  = 0.01;
+    // // 0.01s/点 R_go_to_opencap_request->use_incremental = false; // 使用绝对位置 R_go_to_opencap_response =
+    // ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
     //     node->R_robot_act_j_client_,
     //     R_go_to_opencap_request,
     //     node,
@@ -1291,7 +1325,8 @@ int main(int argc, char** argv) {
     //     "L/robot_move_cart"
     // );
 
-    // /* %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    // /*
+    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     // // open_castbon();
     // ████████╗  ██╗   ██╗  █████╗  ██╗       █████╗  ██████╗  ███╗   ███╗
     // ██╔══  ██║ ██║   ██║ ██╔══██╗ ██║      ██╔══██╗ ██╔══██╗ ████╗ ████║
@@ -1755,8 +1790,9 @@ int main(int argc, char** argv) {
     //     RCLCPP_INFO(node->get_logger(), "Gripper closed successfully");
 
     //     // 转瓶盖
-    //     auto circle_open_cap_response_future = node->R_robot_act_client_->async_send_request(circle_open_cap_request);
-    //     if (rclcpp::spin_until_future_complete(node, circle_open_cap_response_future)
+    //     auto circle_open_cap_response_future =
+    //     node->R_robot_act_client_->async_send_request(circle_open_cap_request); if
+    //     (rclcpp::spin_until_future_complete(node, circle_open_cap_response_future)
     //         != rclcpp::FutureReturnCode::SUCCESS) {
     //         RCLCPP_ERROR(node->get_logger(), "Failed to call service robot_act for open cap position");
     //         return 1;
@@ -1994,7 +2030,7 @@ int main(int argc, char** argv) {
     // pour_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
     // node->gen_actJ_request(
     //     pour_request,
-    //     std::vector<double> { 0, 0, 0, 0, 0, 30 }, 
+    //     std::vector<double> { 0, 0, 0, 0, 0, 30 },
     //     true
     // ); // 使用增量模式
     // pour_request->point_count  = 70;
@@ -2010,7 +2046,7 @@ int main(int argc, char** argv) {
 
     // pour_request->point_count   = 30;
     // pour_request->message_time  = 0.03;
-    // pour_request->target_joints = std::vector<double> { 0, 0, 0, 0, 0, 57 }; 
+    // pour_request->target_joints = std::vector<double> { 0, 0, 0, 0, 0, 57 };
     // pour_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
     //     node->L_robot_act_j_client_,
     //     pour_request,
@@ -2087,8 +2123,8 @@ int main(int argc, char** argv) {
     // std::this_thread::sleep_for(std::chrono::milliseconds(3700));
 
     // R_go_to_opencap_request->command_type  = 0; // ServoMoveStart
-    // R_go_to_opencap_request->target_joints = std::vector<double>({ 85.777, -156.055, 96.643, -157.912, -52.075, 30.0 });
-    // R_go_to_opencap_request->point_count   = 100; // 100个点 R_go_to_opencap_request->message_time  = 0.01;
+    // R_go_to_opencap_request->target_joints = std::vector<double>({ 85.777, -156.055, 96.643, -157.912, -52.075, 30.0
+    // }); R_go_to_opencap_request->point_count   = 100; // 100个点 R_go_to_opencap_request->message_time  = 0.01;
     // // 0.01s/点 R_go_to_opencap_request->use_incremental = false; // 使用绝对位置 R_go_to_opencap_response =
     // ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
     //     node->R_robot_act_j_client_,
@@ -2239,15 +2275,15 @@ int main(int argc, char** argv) {
 
     auto R_act_j_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
     auto L_act_j_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
-    auto R_act_request = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
-    auto L_act_request = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
+    auto R_act_request   = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
+    auto L_act_request   = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
 
     // L goto init pose
-    L_act_j_request->target_joints = node->ball_L_joint_init_pose_;
-    L_act_j_request->point_count = 100; // 100个点
-    L_act_j_request->message_time = 0.01; // 0.01s
+    L_act_j_request->target_joints   = node->ball_L_joint_init_pose_;
+    L_act_j_request->point_count     = 100;   // 100个点
+    L_act_j_request->message_time    = 0.01;  // 0.01s
     L_act_j_request->use_incremental = false; // 使用绝对位置
-    auto L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    auto L_act_j_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->L_robot_act_j_client_,
         L_act_j_request,
         node,
@@ -2257,11 +2293,11 @@ int main(int argc, char** argv) {
     // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
     RCLCPP_INFO(node->get_logger(), "L robot moved to initial position");
     // R goto init pose
-    R_act_j_request->target_joints = node->ball_R_joint_init_pose_;
-    R_act_j_request->point_count = 100; // 100个点
-    R_act_j_request->message_time = 0.01; // 0.01
+    R_act_j_request->target_joints   = node->ball_R_joint_init_pose_;
+    R_act_j_request->point_count     = 100;   // 100个点
+    R_act_j_request->message_time    = 0.01;  // 0.01
     R_act_j_request->use_incremental = false; // 使用绝对位置
-    auto R_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    auto R_act_j_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->R_robot_act_j_client_,
         R_act_j_request,
         node,
@@ -2271,12 +2307,12 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 1000))); // 运动时间 + 额外500ms
     RCLCPP_INFO(node->get_logger(), "R robot moved to initial position");
 
-    //R robot move to ball 1 position
-    R_act_j_request->target_joints = node->ball_R_per_1_joint_pose_;
-    R_act_j_request->point_count = 100; // 100个点
-    R_act_j_request->message_time = 0.01; // 0.01
+    // R robot move to ball 1 position
+    R_act_j_request->target_joints   = node->ball_R_per_1_joint_pose_;
+    R_act_j_request->point_count     = 100;   // 100个点
+    R_act_j_request->message_time    = 0.01;  // 0.01
     R_act_j_request->use_incremental = false; // 使用绝对位置
-    R_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->R_robot_act_j_client_,
         R_act_j_request,
         node,
@@ -2285,9 +2321,9 @@ int main(int argc, char** argv) {
     );
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
     RCLCPP_INFO(node->get_logger(), "R robot moved to ball per 1 position");
-    //R robot move to ball 1 position
+    // R robot move to ball 1 position
     R_act_j_request->target_joints = node->ball_R_1_joint_pose_;
-    R_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    R_act_j_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->R_robot_act_j_client_,
         R_act_j_request,
         node,
@@ -2297,12 +2333,12 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
     RCLCPP_INFO(node->get_logger(), "R robot moved to ball 1 position");
 
-        // L robot move to ball 1 position
-        L_act_j_request->target_joints = node->ball_L_1_joint_pose_;
-    L_act_j_request->point_count = 100; // 100个点
-    L_act_j_request->message_time = 0.01; // 0.01
+    // L robot move to ball 1 position
+    L_act_j_request->target_joints   = node->ball_L_1_joint_pose_;
+    L_act_j_request->point_count     = 100;   // 100个点
+    L_act_j_request->message_time    = 0.01;  // 0.01
     L_act_j_request->use_incremental = false; // 使用绝对位置
-    L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->L_robot_act_j_client_,
         L_act_j_request,
         node,
@@ -2327,9 +2363,9 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5000)); // 等待松手
 
     // 松手
-    L_act_j_request->target_joints = std::vector<double> { 0, 0, 0, 0, 10, 0 }; // L robot 松手
-    L_act_j_request->use_incremental = true; 
-    L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 10, 0 }; // L robot 松手
+    L_act_j_request->use_incremental = true;
+    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->L_robot_act_j_client_,
         L_act_j_request,
         node,
@@ -2341,7 +2377,7 @@ int main(int argc, char** argv) {
 
     // R robot move back to per 1 position
     R_act_j_request->target_joints = node->ball_R_per_1_joint_pose_;
-    R_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    R_act_j_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->R_robot_act_j_client_,
         R_act_j_request,
         node,
@@ -2350,19 +2386,19 @@ int main(int argc, char** argv) {
     );
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
     RCLCPP_INFO(node->get_logger(), "R robot moved back to ball per 1 position");
-    //L & R robot move back to initial position
-    L_act_j_request->target_joints = node->ball_L_joint_init_pose_;
+    // L & R robot move back to initial position
+    L_act_j_request->target_joints   = node->ball_L_joint_init_pose_;
     L_act_j_request->use_incremental = false; // 使用绝对位置
-    L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->L_robot_act_j_client_,
         L_act_j_request,
         node,
         std::chrono::seconds(10),
         "L/robot_act_j"
     );
-    R_act_j_request->target_joints = node->ball_R_joint_init_pose_;
+    R_act_j_request->target_joints   = node->ball_R_joint_init_pose_;
     R_act_j_request->use_incremental = false; // 使用绝对位置
-    R_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->R_robot_act_j_client_,
         R_act_j_request,
         node,
@@ -2388,11 +2424,11 @@ int main(int argc, char** argv) {
     RCLCPP_INFO(node->get_logger(), "R robot moved to ball 2 position");
 
     // L robot move to ball 2 position
-    L_act_j_request->target_joints = node->ball_L_2_joint_pose_;
-    L_act_j_request->point_count = 100; // 100个点
-    L_act_j_request->message_time = 0.01; // 0.01
+    L_act_j_request->target_joints   = node->ball_L_2_joint_pose_;
+    L_act_j_request->point_count     = 100;   // 100个点
+    L_act_j_request->message_time    = 0.01;  // 0.01
     L_act_j_request->use_incremental = false; // 使用绝对位置
-    L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->L_robot_act_j_client_,
         L_act_j_request,
         node,
@@ -2411,20 +2447,19 @@ int main(int argc, char** argv) {
     );
     RCLCPP_INFO(node->get_logger(), "L robot moved to ball 2 position");
 
-
-    //L&R open hand
-    L_act_j_request->target_joints = std::vector<double> { 0, 0, 0, 0, 16, 0 }; // L robot 松手
+    // L&R open hand
+    L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 16, 0 }; // L robot 松手
     L_act_j_request->use_incremental = true;
-    L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->L_robot_act_j_client_,
         L_act_j_request,
         node,
         std::chrono::seconds(10),
         "L/robot_act_j"
     );
-    R_act_j_request->target_joints = std::vector<double> { 0, 0, 0, 0, 8, 0 }; // R robot 松手
+    R_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 8, 0 }; // R robot 松手
     R_act_j_request->use_incremental = true;
-    R_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
         node->R_robot_act_j_client_,
         R_act_j_request,
         node,
@@ -2433,10 +2468,6 @@ int main(int argc, char** argv) {
     );
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
     RCLCPP_INFO(node->get_logger(), "L robot released ball 2");
-
-
-
-
 
     rclcpp::shutdown();
     return 0;
@@ -2498,7 +2529,6 @@ int L_fix(
     return {};
 }
 
-// f. u. c. k.  a. l. l. 
+// f. u. c. k.  a. l. l.
 
-
-// Q.E.D.  
+// Q.E.D.

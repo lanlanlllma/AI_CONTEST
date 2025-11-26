@@ -1,0 +1,8 @@
+# 请求部分 - 仅触发，使用最新订阅的图像
+# (空请求)
+---
+# 响应部分
+bool success                      # 检测是否成功
+int32 num_grasps                  # 检测到的抓取数量
+string message                    # 返回消息或错误描述
+GraspResult[] grasps              # 抓取结果数组
