@@ -196,8 +196,8 @@ def generate_launch_description():
         declare_rate_cmd,
         config_file_arg,
         static_tf_node,
-        detector_node,
-        depth_handler_node,
+        # detector_node,
+        # depth_handler_node,
         camera_info_interceptor_node,
-        # gripper_node
+        gripper_node
     ])

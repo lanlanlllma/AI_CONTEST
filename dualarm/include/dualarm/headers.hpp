@@ -247,7 +247,7 @@ public:
     std::vector<RobotKalmanFilter> kalman_filters_;
     std::vector<object_detection> detected_objects_;
     rclcpp::CallbackGroup::SharedPtr obj_detect_cb_group_;
-    int desk_height_    = 0;  // 台面高度
+    int desk_height_    = 213.7;  // 台面高度
     int cola_height_    = 91; // 可乐高度
     int cestbon_height_ = 91; // 矿泉水高度
     std::vector<double> ball_R_joint_init_pose_;
@@ -344,12 +344,12 @@ public:
         request->tcp_pose.rx   = tcp_pose[3];
         request->tcp_pose.ry   = tcp_pose[4];
         request->tcp_pose.rz   = tcp_pose[5];
-        request->velocity      = 100;
+        request->velocity      = 80;
         request->acceleration  = 100;
         request->tool          = 0;
         request->blend_time    = -1;
         request->config        = -1;
-        request->ovl           = 100;
+        request->ovl           = 80;
         request->user          = 0;
         request->use_increment = use_increment;
     }
