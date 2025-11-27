@@ -16,6 +16,11 @@ find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(jsoncpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 # 生成消息和服务
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -34,6 +39,11 @@ ament_target_dependencies(grasp_detect_node
   std_msgs
   cv_bridge
   OpenCV
+  visualization_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 target_link_libraries(grasp_detect_node
   jsoncpp

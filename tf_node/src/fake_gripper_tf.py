@@ -1,59 +1,88 @@
 #!/usr/bin/env python3
 
-import rospy
+import rclpy
+from rclpy.node import Node
 import tf2_ros
-import geometry_msgs.msg
-from tf.transformations import quaternion_from_euler, euler_from_quaternion
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
-def main():
-    rospy.init_node('fake_gripper_tf_publisher')
+class FakeGripperTFPublisher(Node):
+    def __init__(self):
+        super().__init__('fake_gripper_tf_publisher')
+        
+        # 声明参数
+        self.declare_parameter('gripper_frame', 'Lgripper')  # 夹爪的坐标系
+        self.declare_parameter('base_frame', 'Lrobot_base')  # 基座坐标系
+        self.declare_parameter('fake_frame', 'fake_gripper_frame')  # 要发布的虚假坐标系名称
+        self.declare_parameter('parent_frame', 'Lrobot_base')  # 父坐标系
+        
+        # 获取参数
+        self.gripper_frame = self.get_parameter('gripper_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.fake_frame = self.get_parameter('fake_frame').value
+        self.parent_frame = self.get_parameter('parent_frame').value
+        
+        # 初始化 TF
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        
+        self.get_logger().info(
+            f'Publishing fake TF "{self.fake_frame}" with position from "{self.gripper_frame}" '
+            f'and orientation from "{self.base_frame}" in parent frame "{self.parent_frame}"'
+        )
+        
+        # 创建定时器，10 Hz
+        self.timer = self.create_timer(0.1, self.publish_fake_tf)
     
-    tfBuffer = tf2_ros.Buffer()
-    listener = tf2_ros.TransformListener(tfBuffer)
-    
-    br = tf2_ros.TransformBroadcaster()
-    
-    rate = rospy.Rate(10.0)  # 10 Hz
-    
-    # 源坐标系和目标坐标系的名称
-    gripper_frame = rospy.get_param('~gripper_frame', 'gripper_link')  # 夹爪的坐标系
-    base_frame = rospy.get_param('~base_frame', 'base_link')  # 基座坐标系
-    fake_frame = rospy.get_param('~fake_frame', 'fake_gripper_frame')  # 要发布的虚假坐标系名称
-    
-    rospy.loginfo(f"Publishing fake TF from {gripper_frame} with orientation from {base_frame}")
-    
-    while not rospy.is_shutdown():
+    def publish_fake_tf(self):
         try:
-            # 获取夹爪相对于世界的变换
-            gripper_trans = tfBuffer.lookup_transform('world', gripper_frame, rospy.Time())
+            # 等待 TF 可用
+            # 获取夹爪相对于基座的变换（因为我们要在基座坐标系下发布）
+            gripper_trans = self.tf_buffer.lookup_transform(
+                self.base_frame,  # 改为从 base_frame 查询
+                self.gripper_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
             
-            # 获取基座相对于世界的变换
-            base_trans = tfBuffer.lookup_transform('world', base_frame, rospy.Time())
+            # 基座相对于自己的变换是单位变换（位置 [0,0,0]，姿态单位四元数）
+            # 不需要查询，直接使用单位姿态
             
             # 创建新的变换
-            trans = geometry_msgs.msg.TransformStamped()
-            trans.header.stamp = rospy.Time.now()
-            trans.header.frame_id = 'world'
-            trans.child_frame_id = fake_frame
+            trans = TransformStamped()
+            trans.header.stamp = self.get_clock().now().to_msg()
+            trans.header.frame_id = self.parent_frame
+            trans.child_frame_id = self.fake_frame
             
-            # 使用夹爪的位置
+            # 使用夹爪的位置（已经是相对于 base_frame 的）
             trans.transform.translation.x = gripper_trans.transform.translation.x
             trans.transform.translation.y = gripper_trans.transform.translation.y
             trans.transform.translation.z = gripper_trans.transform.translation.z
             
-            # 使用基座的姿态
-            trans.transform.rotation = base_trans.transform.rotation
+            # 使用基座的姿态（单位四元数，因为我们希望姿态与 base_frame 一致）
+            trans.transform.rotation.x = 0.0
+            trans.transform.rotation.y = 0.0
+            trans.transform.rotation.z = 0.0
+            trans.transform.rotation.w = 1.0
             
             # 发布变换
-            br.sendTransform(trans)
+            self.tf_broadcaster.sendTransform(trans)
             
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn(f"TF Error: {e}")
-            
-        rate.sleep()
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(f'TF Error: {e}', throttle_duration_sec=1.0)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FakeGripperTFPublisher()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
-    try:
-        main()
-    except rospy.ROSInterruptException:
-        pass
+    main()

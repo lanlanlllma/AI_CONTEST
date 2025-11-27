@@ -114,10 +114,11 @@ RobotMain::RobotMain(const rclcpp::NodeOptions& options): Node("robot_main", opt
     L_robot_set_speed_client_  = this->create_client<robo_ctrl::srv::RobotSetSpeed>(ROBOT_L + "/robot_set_speed");
     L_robot_act_j_client_      = this->create_client<robo_ctrl::srv::RobotActJ>(ROBOT_L + "/robot_act_j");
     gripper_command_client_    = this->create_client<epg50_gripper_ros::srv::GripperCommand>("/epg50_gripper/command");
+    L_grasp_detect_mask_client_ = this->create_client<grab_detect::srv::GraspDetectTriggerMask>("/grasp_detect_trigger_mask");
 
     this->declare_parameter("init_tcp_pose", std::vector<double> { 168.0, -102.0, 394.0, -111.556, 0.0, -90.0 });
     this->declare_parameter("open_cap_joint_pose", std::vector<double> { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 });
-    this->declare_parameter("desk_height", 190);
+    this->declare_parameter("desk_height", 27.75);
     this->declare_parameter("cola_height", 91);
     this->declare_parameter("cestbon_height", 91);
     this->declare_parameter("robot_speed", 0.5);
@@ -217,6 +218,10 @@ void RobotMain::handleObjDetection(const detector::msg::Bbox2dArray::SharedPtr b
             new_obj.position    = { x_pos, y_pos, z_pos };
             new_obj.age         = 0;
             new_obj.valid_count = 1;
+            new_obj.bbox_x      = bbox2d.x;
+            new_obj.bbox_y      = bbox2d.y;
+            new_obj.bbox_width  = bbox2d.width;
+            new_obj.bbox_height = bbox2d.height;
             new_obj.add_class_observation(bbox2d.class_id);
 
             // 查找是否已存在相同位置的物体（仅考虑 X-Y 平面距离）
@@ -246,21 +251,15 @@ void RobotMain::handleObjDetection(const detector::msg::Bbox2dArray::SharedPtr b
                 // 重置年龄
                 existing_obj.age = 0;
                 existing_obj.valid_count++;
+                
+                // 更新边界框信息
+                existing_obj.bbox_x      = bbox2d.x;
+                existing_obj.bbox_y      = bbox2d.y;
+                existing_obj.bbox_width  = bbox2d.width;
+                existing_obj.bbox_height = bbox2d.height;
 
-                // 添加类别观测
+                // 添加类别观测（如果是 class_id=1 会在此函数内自动设置 id=1）
                 existing_obj.add_class_observation(bbox2d.class_id);
-
-                // 更新稳定的类别ID（基于历史投票）
-                int stable_id = existing_obj.get_stable_class_id();
-                if (stable_id != existing_obj.id) {
-                    RCLCPP_INFO(
-                        this->get_logger(),
-                        "Class ID corrected from %d to %d based on history voting",
-                        existing_obj.id,
-                        stable_id
-                    );
-                    existing_obj.id = stable_id;
-                }
 
                 // 使用卡尔曼滤波更新位置
                 std::vector<double> filtered_position = kalman_filters_[best_match_idx].filterPose(new_obj.position);
@@ -268,15 +267,15 @@ void RobotMain::handleObjDetection(const detector::msg::Bbox2dArray::SharedPtr b
 
                 RCLCPP_INFO(
                     this->get_logger(),
-                    "Updated object %d (stable_id=%d) position: [%.3f, %.3f, %.3f], age: %d, valid_count: %d, class_stable: %s",
+                    "Updated object %d position: [%.3f, %.3f, %.3f], age: %d, valid_count: %d, class_stable: %s, has_seen_class_1: %s",
                     existing_obj.id,
-                    stable_id,
                     filtered_position[0],
                     filtered_position[1],
                     filtered_position[2],
                     existing_obj.age,
                     existing_obj.valid_count,
-                    existing_obj.is_class_stable() ? "YES" : "NO"
+                    existing_obj.is_class_stable() ? "YES" : "NO",
+                    existing_obj.has_seen_class_1 ? "YES" : "NO"
                 );
             } else {
                 // 新物体，添加到列表中
@@ -424,6 +423,24 @@ bool waitForServiceEnhanced(
     RCLCPP_INFO(node->get_logger(), "Service '%s' is available", service_name.c_str());
     return true;
 }
+// auto open_gripper (rclcpp::Node::SharedPtr node) {
+//     auto gripper_request      = std::make_shared<epg50_gripper_ros::srv::GripperCommand::Request>();
+//     gripper_request->slave_id = GRIPPER_ID_L;
+//     gripper_request->command  = GRIPPER_SET;
+//     gripper_request->position = GRIPPER_OPEN;
+//     gripper_request->speed    = 255; // 设置速度为255
+//     gripper_request->torque   = 255; // 设置扭矩为255
+//     auto gripper_future       = node->gripper_command_client_->async_send_request(gripper_request);
+//     if (rclcpp::spin_until_future_complete(node, gripper_future) != rclcpp::FutureReturnCode::SUCCESS) {
+//         RCLCPP_ERROR(node->get_logger(), "Failed to call service robot_act for gripper command");
+//         return 1;
+//     }
+//     auto gripper_response = gripper_future.get();
+//     if (!gripper_response->success) {
+//         RCLCPP_ERROR(node->get_logger(), "Failed to open gripper");
+//         return 1;
+//     }
+// };
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
@@ -457,28 +474,189 @@ int main(int argc, char** argv) {
     }
 
     // 等待夹爪命令服务
-    if (!waitForServiceEnhanced(node->gripper_command_client_, node, "gripper_command")) {
-        return 1;
-    }
-
+    // if (!waitForServiceEnhanced(node->gripper_command_client_, node, "gripper_command")) {
+    //     return 1;
+    // }
+    // 停止检测更新
+    node->setObjectUpdateEnabled(true);
     RCLCPP_INFO(node->get_logger(), "All required services are now available!");
     // rclcpp::sleep_for(std::chrono::seconds(5));
-    // 看向台面 - 使用robot_move绝对 坐标
-    auto look_at_table_request           = std::make_shared<robo_ctrl::srv::RobotMoveCart::Request>();
-    look_at_table_request->tcp_pose.x    = node->init_tcp_pose_vec_[0];
-    look_at_table_request->tcp_pose.y    = node->init_tcp_pose_vec_[1];
-    look_at_table_request->tcp_pose.z    = node->init_tcp_pose_vec_[2];
-    look_at_table_request->tcp_pose.rx   = node->init_tcp_pose_vec_[3];
-    look_at_table_request->tcp_pose.ry   = node->init_tcp_pose_vec_[4];
-    look_at_table_request->tcp_pose.rz   = node->init_tcp_pose_vec_[5];
-    look_at_table_request->acceleration  = 100;
-    look_at_table_request->velocity      = 100;
-    look_at_table_request->config        = -1;
-    look_at_table_request->blend_time    = 0.0;   // 不使用混合时间
-    look_at_table_request->use_increment = false; // 使用绝对位置
-    look_at_table_request->tool          = -1;    // 使用默认工具
-    look_at_table_request->user          = -1;    // 使用默认用户
-    look_at_table_request->ovl           = 0;
+    // 看向台面 - 使用robot_act_j服务
+    auto L_act_j_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
+    L_act_j_request->command_type  = 0; // ServoMoveStart
+    L_act_j_request->target_joints = std::vector<double>({ 
+        156.1977,
+        -54.6986,
+        -0.0274,
+        -38.7380,
+        -88.2650,
+        -13.9097 });
+    L_act_j_request->point_count     = 100;     // 100个点
+    L_act_j_request->message_time    = 0.01;    // 0.01s/点
+    L_act_j_request->use_incremental = false; // 使用绝对位置
+    auto L_act_j_response = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+        node->L_robot_act_j_client_,
+        L_act_j_request,
+        node,
+        std::chrono::seconds(10),
+        "L/robot_act_j"
+    );
+    // 开始检查
+    node->setObjectUpdateEnabled(true);
+
+    if (node->hasObject(1)) {
+        RCLCPP_INFO(node->get_logger(), "Found valid object with class ID 1");
+    } else {
+        RCLCPP_WARN(node->get_logger(), "No valid object with class ID 1 found");
+    }
+
+    // 准备抓取id=1的物体
+    // auto gripper_request      = std::make_shared<epg50_gripper_ros::srv::GripperCommand::Request>();
+    // gripper_request->slave_id = GRIPPER_ID_L;
+    // gripper_request->command  = GRIPPER_SET;
+    // gripper_request->position = GRIPPER_OPEN;
+    // gripper_request->speed    = 255; // 设置速度为255
+    // gripper_request->torque   = 255; // 设置扭矩为255
+    // auto gripper_future       = node->gripper_command_client_->async_send_request(gripper_request);
+    // if (rclcpp::spin_until_future_complete(node, gripper_future) != rclcpp::FutureReturnCode::SUCCESS) {
+    //     RCLCPP_ERROR(node->get_logger(), "Failed to call service robot_act for gripper command");
+    //     return 1;
+    // }
+    // auto gripper_response = gripper_future.get();
+    // if (!gripper_response->success) {
+    //     RCLCPP_ERROR(node->get_logger(), "Failed to open gripper");
+    //     return 1;
+    // }
+
+    // 生成obj bbox 的mask，使用cv2
+    // 获取位置和边界框信息
+    std::vector<double> object_position;
+    float bbox_x = 0.0f, bbox_y = 0.0f, bbox_width = 0.0f, bbox_height = 0.0f;
+    bool found_target = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(node->detected_objects_mutex_);
+        for (const auto& obj: node->detected_objects_) {
+            if (obj.id == 1 && obj.is_valid()) {
+                object_position = obj.position;
+                bbox_x = obj.bbox_x;
+                bbox_y = obj.bbox_y;
+                bbox_width = obj.bbox_width;
+                bbox_height = obj.bbox_height;
+                found_target = true;
+                break;
+            }
+        }
+    }
+    
+    if (!found_target || object_position.empty()) {
+        RCLCPP_ERROR(node->get_logger(), "No valid object with class ID 1 found for grasping");
+        return 1;
+    }
+    
+    RCLCPP_INFO(
+        node->get_logger(),
+        "Preparing to grasp object ID 1 at position: [%.3f, %.3f, %.3f]",
+        object_position[0],
+        object_position[1],
+        object_position[2]
+    );
+    
+    // 创建掩码图像（假设相机分辨率为 1280x720）
+    // TODO: 从相机参数或订阅的图像消息中获取实际分辨率
+    int image_width = 1280;
+    int image_height = 720;
+    cv::Mat mask = cv::Mat::zeros(image_height, image_width, CV_8UC1);
+    
+    // 计算 bbox 的左上角和右下角坐标
+    int x1 = std::max(0, static_cast<int>(bbox_x - bbox_width / 2.0f));
+    int y1 = std::max(0, static_cast<int>(bbox_y - bbox_height / 2.0f));
+    int x2 = std::min(image_width - 1, static_cast<int>(bbox_x + bbox_width / 2.0f));
+    int y2 = std::min(image_height - 1, static_cast<int>(bbox_y + bbox_height / 2.0f));
+    // 扩大一些区域以确保覆盖整个物体
+    int expand_pixels = 30;
+    x1 = std::max(0, x1 - expand_pixels);
+    y1 = std::max(0, y1 - expand_pixels);
+    x2 = std::min(image_width - 1, x2 + expand_pixels);
+    y2 = std::min(image_height - 1, y2 + expand_pixels);
+    
+    // 在掩码上绘制白色矩形（255 表示目标物体区域）
+    cv::rectangle(mask, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(255), cv::FILLED);
+    
+    RCLCPP_INFO(
+        node->get_logger(),
+        "Generated mask for object ID 1: bbox center=(%.1f, %.1f), size=(%.1f x %.1f), rect=[%d, %d, %d, %d]",
+        bbox_x, bbox_y, bbox_width, bbox_height,
+        x1, y1, x2, y2
+    );
+
+    // 将 cv::Mat 掩码转换为 sensor_msgs::Image
+    auto mask_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "mono8", mask).toImageMsg();
+    mask_msg->header.stamp = node->now();
+    mask_msg->header.frame_id = "camera_link";
+    
+    RCLCPP_INFO(node->get_logger(), "Calling grasp detection service with mask...");
+    
+    // 调用抓取检测服务（带掩码）
+    auto grasp_request = std::make_shared<grab_detect::srv::GraspDetectTriggerMask::Request>();
+    grasp_request->mask_image = *mask_msg;
+    
+    auto grasp_future = node->L_grasp_detect_mask_client_->async_send_request(grasp_request);
+    
+    if (rclcpp::spin_until_future_complete(node, grasp_future, std::chrono::seconds(10)) 
+        != rclcpp::FutureReturnCode::SUCCESS) {
+        RCLCPP_ERROR(node->get_logger(), "Failed to call grasp detection service");
+        return 1;
+    }
+    
+    auto grasp_response = grasp_future.get();
+    
+    if (!grasp_response->success || grasp_response->num_grasps == 0) {
+        RCLCPP_ERROR(
+            node->get_logger(),
+            "Grasp detection failed: %s (num_grasps=%d)",
+            grasp_response->message.c_str(),
+            grasp_response->num_grasps
+        );
+        return 1;
+    }
+    
+    RCLCPP_INFO(
+        node->get_logger(),
+        "Grasp detection succeeded: %d grasps detected. Message: %s",
+        grasp_response->num_grasps,
+        grasp_response->message.c_str()
+    );
+    
+    // 检查并打印最佳抓取在 fake_gripper_frame 下的坐标
+    if (grasp_response->best_under_gripper_fake.size() == 6) {
+        RCLCPP_INFO(
+            node->get_logger(),
+            "Best grasp in fake_gripper_frame: position=(%.3f, %.3f, %.3f), rpy=(%.3f, %.3f, %.3f)",
+            grasp_response->best_under_gripper_fake[0],
+            grasp_response->best_under_gripper_fake[1],
+            grasp_response->best_under_gripper_fake[2],
+            grasp_response->best_under_gripper_fake[3],
+            grasp_response->best_under_gripper_fake[4],
+            grasp_response->best_under_gripper_fake[5]
+        );
+    } else {
+        RCLCPP_WARN(
+            node->get_logger(),
+            "best_under_gripper_fake is empty or invalid (size=%zu). TF transform may have failed.",
+            grasp_response->best_under_gripper_fake.size()
+        );
+    }
+
+    // 移动到目标位置上方40mm处
+
+    
+    // TODO: 选择最佳抓取并执行抓取动作
+    // 抓取结果保存在 grasp_response->grasps 中
+    
+    // 等待姿态修正完成 - 基于角度大小估算时间
+
+    return 0;
 
     // auto look_at_table_response = ServiceCaller<robo_ctrl::srv::RobotMoveCart>::callServiceSync(
     //     node->L_robot_move_cart_client_,
@@ -717,22 +895,7 @@ int main(int argc, char** argv) {
     //     target_tcp_position[2]
     // );
     // // 打开架爪
-    // auto gripper_request      = std::make_shared<epg50_gripper_ros::srv::GripperCommand::Request>();
-    // gripper_request->slave_id = GRIPPER_ID_L;
-    // gripper_request->command  = GRIPPER_SET;
-    // gripper_request->position = GRIPPER_OPEN;
-    // gripper_request->speed    = 255; // 设置速度为255
-    // gripper_request->torque   = 255; // 设置扭矩为255
-    // auto gripper_future       = node->gripper_command_client_->async_send_request(gripper_request);
-    // if (rclcpp::spin_until_future_complete(node, gripper_future) != rclcpp::FutureReturnCode::SUCCESS) {
-    //     RCLCPP_ERROR(node->get_logger(), "Failed to call service robot_act for gripper command");
-    //     return 1;
-    // }
-    // auto gripper_response = gripper_future.get();
-    // if (!gripper_response->success) {
-    //     RCLCPP_ERROR(node->get_logger(), "Failed to open gripper");
-    //     return 1;
-    // }
+
     // RCLCPP_INFO(node->get_logger(), "Gripper opened successfully");
     // std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -2231,243 +2394,243 @@ int main(int argc, char** argv) {
 
     // rclcpp::sleep_for(std::chrono::seconds(5));
     // // 看向台面 - 使用robot_move绝对 坐标
-    look_at_table_request                = std::make_shared<robo_ctrl::srv::RobotMoveCart::Request>();
-    look_at_table_request->tcp_pose.x    = node->init_tcp_pose_vec_[0];
-    look_at_table_request->tcp_pose.y    = node->init_tcp_pose_vec_[1];
-    look_at_table_request->tcp_pose.z    = node->init_tcp_pose_vec_[2];
-    look_at_table_request->tcp_pose.rx   = node->init_tcp_pose_vec_[3];
-    look_at_table_request->tcp_pose.ry   = node->init_tcp_pose_vec_[4];
-    look_at_table_request->tcp_pose.rz   = node->init_tcp_pose_vec_[5];
-    look_at_table_request->acceleration  = 100;
-    look_at_table_request->velocity      = 100;
-    look_at_table_request->config        = -1;
-    look_at_table_request->blend_time    = 0.0;   // 不使用混合时间
-    look_at_table_request->use_increment = false; // 使用绝对位置
-    look_at_table_request->tool          = -1;    // 使用默认工具
-    look_at_table_request->user          = -1;    // 使用默认用户
-    look_at_table_request->ovl           = 0;
+    // look_at_table_request                = std::make_shared<robo_ctrl::srv::RobotMoveCart::Request>();
+    // look_at_table_request->tcp_pose.x    = node->init_tcp_pose_vec_[0];
+    // look_at_table_request->tcp_pose.y    = node->init_tcp_pose_vec_[1];
+    // look_at_table_request->tcp_pose.z    = node->init_tcp_pose_vec_[2];
+    // look_at_table_request->tcp_pose.rx   = node->init_tcp_pose_vec_[3];
+    // look_at_table_request->tcp_pose.ry   = node->init_tcp_pose_vec_[4];
+    // look_at_table_request->tcp_pose.rz   = node->init_tcp_pose_vec_[5];
+    // look_at_table_request->acceleration  = 100;
+    // look_at_table_request->velocity      = 100;
+    // look_at_table_request->config        = -1;
+    // look_at_table_request->blend_time    = 0.0;   // 不使用混合时间
+    // look_at_table_request->use_increment = false; // 使用绝对位置
+    // look_at_table_request->tool          = -1;    // 使用默认工具
+    // look_at_table_request->user          = -1;    // 使用默认用户
+    // look_at_table_request->ovl           = 0;
 
-    auto look_at_table_response_ball = ServiceCaller<robo_ctrl::srv::RobotMoveCart>::callServiceSync(
-        node->L_robot_move_cart_client_,
-        look_at_table_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_move_cart"
-    );
+    // auto look_at_table_response_ball = ServiceCaller<robo_ctrl::srv::RobotMoveCart>::callServiceSync(
+    //     node->L_robot_move_cart_client_,
+    //     look_at_table_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_move_cart"
+    // );
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(2000))); // 运动时间 + 额外500ms
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(2000))); // 运动时间 + 额外500ms
 
-    /*
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    // get_ball();
-    ████████╗  ██╗   ██╗  █████╗  ██╗       █████╗  ██████╗  ███╗   ███╗
-    ██╔══  ██║ ██║   ██║ ██╔══██╗ ██║      ██╔══██╗ ██╔══██╗ ████╗ ████║
-    ██║    ██║ ██║   ██║ ███████║ ██║      ███████║ ██████╔╝ ██╔████╔██║
-    ██║    ██║ ██║   ██║ ██╔══██║ ██║      ██╔══██║ ██╔══██╗ ██║╚██╔╝██║
-    ████████║  ╚██████╔╝ ██║  ██║ ███████╗ ██║  ██║ ██║  ██║ ██║ ╚═╝ ██║
-    ╚═══════╝   ╚═════╝  ╚═╝  ╚═╝ ╚══════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝     ╚═╝
-        // f. u. c. k.  b. a. l. l.
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    */
+    // /*
+    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    // // get_ball();
+    // ████████╗  ██╗   ██╗  █████╗  ██╗       █████╗  ██████╗  ███╗   ███╗
+    // ██╔══  ██║ ██║   ██║ ██╔══██╗ ██║      ██╔══██╗ ██╔══██╗ ████╗ ████║
+    // ██║    ██║ ██║   ██║ ███████║ ██║      ███████║ ██████╔╝ ██╔████╔██║
+    // ██║    ██║ ██║   ██║ ██╔══██║ ██║      ██╔══██║ ██╔══██╗ ██║╚██╔╝██║
+    // ████████║  ╚██████╔╝ ██║  ██║ ███████╗ ██║  ██║ ██║  ██║ ██║ ╚═╝ ██║
+    // ╚═══════╝   ╚═════╝  ╚═╝  ╚═╝ ╚══════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝     ╚═╝
+    //     // f. u. c. k.  b. a. l. l.
+    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    // */
 
-    // 等待初始位置移动完成
-    std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+    // // 等待初始位置移动完成
+    // std::this_thread::sleep_for(std::chrono::milliseconds(10000));
 
-    auto R_act_j_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
-    auto L_act_j_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
-    auto R_act_request   = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
-    auto L_act_request   = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
+    // auto R_act_j_request = std::make_shared<robo_ctrl::srv::RobotActJ::Request>();
+    
+    // auto R_act_request   = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
+    // auto L_act_request   = std::make_shared<robo_ctrl::srv::RobotAct::Request>();
 
-    // L goto init pose
-    L_act_j_request->target_joints   = node->ball_L_joint_init_pose_;
-    L_act_j_request->point_count     = 100;   // 100个点
-    L_act_j_request->message_time    = 0.01;  // 0.01s
-    L_act_j_request->use_incremental = false; // 使用绝对位置
-    auto L_act_j_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
+    // // L goto init pose
+    // L_act_j_request->target_joints   = node->ball_L_joint_init_pose_;
+    // L_act_j_request->point_count     = 100;   // 100个点
+    // L_act_j_request->message_time    = 0.01;  // 0.01s
+    // L_act_j_request->use_incremental = false; // 使用绝对位置
+    // auto L_act_j_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "L robot moved to initial position");
+    // // R goto init pose
+    // R_act_j_request->target_joints   = node->ball_R_joint_init_pose_;
+    // R_act_j_request->point_count     = 100;   // 100个点
+    // R_act_j_request->message_time    = 0.01;  // 0.01
+    // R_act_j_request->use_incremental = false; // 使用绝对位置
+    // auto R_act_j_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 1000))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "R robot moved to initial position");
+
+    // // R robot move to ball 1 position
+    // R_act_j_request->target_joints   = node->ball_R_per_1_joint_pose_;
+    // R_act_j_request->point_count     = 100;   // 100个点
+    // R_act_j_request->message_time    = 0.01;  // 0.01
+    // R_act_j_request->use_incremental = false; // 使用绝对位置
+    // R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
     // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "L robot moved to initial position");
-    // R goto init pose
-    R_act_j_request->target_joints   = node->ball_R_joint_init_pose_;
-    R_act_j_request->point_count     = 100;   // 100个点
-    R_act_j_request->message_time    = 0.01;  // 0.01
-    R_act_j_request->use_incremental = false; // 使用绝对位置
-    auto R_act_j_response            = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 1000))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "R robot moved to initial position");
+    // RCLCPP_INFO(node->get_logger(), "R robot moved to ball per 1 position");
+    // // R robot move to ball 1 position
+    // R_act_j_request->target_joints = node->ball_R_1_joint_pose_;
+    // R_act_j_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "R robot moved to ball 1 position");
 
-    // R robot move to ball 1 position
-    R_act_j_request->target_joints   = node->ball_R_per_1_joint_pose_;
-    R_act_j_request->point_count     = 100;   // 100个点
-    R_act_j_request->message_time    = 0.01;  // 0.01
-    R_act_j_request->use_incremental = false; // 使用绝对位置
-    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "R robot moved to ball per 1 position");
-    // R robot move to ball 1 position
-    R_act_j_request->target_joints = node->ball_R_1_joint_pose_;
-    R_act_j_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "R robot moved to ball 1 position");
+    // // L robot move to ball 1 position
+    // L_act_j_request->target_joints   = node->ball_L_1_joint_pose_;
+    // L_act_j_request->point_count     = 100;   // 100个点
+    // L_act_j_request->message_time    = 0.01;  // 0.01
+    // L_act_j_request->use_incremental = false; // 使用绝对位置
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "L robot moved to ball 1 position");
 
-    // L robot move to ball 1 position
-    L_act_j_request->target_joints   = node->ball_L_1_joint_pose_;
-    L_act_j_request->point_count     = 100;   // 100个点
-    L_act_j_request->message_time    = 0.01;  // 0.01
-    L_act_j_request->use_incremental = false; // 使用绝对位置
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "L robot moved to ball 1 position");
+    // L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, -10, 0 }; // L robot 抓取球1
+    // L_act_j_request->use_incremental = true;
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "L robot released ball 1");
 
-    L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, -10, 0 }; // L robot 抓取球1
-    L_act_j_request->use_incremental = true;
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "L robot released ball 1");
+    // std::this_thread::sleep_for(std::chrono::milliseconds(5000)); // 等待松手
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000)); // 等待松手
+    // // 松手
+    // L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 10, 0 }; // L robot 松手
+    // L_act_j_request->use_incremental = true;
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "L robot released ball 1");
 
-    // 松手
-    L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 10, 0 }; // L robot 松手
-    L_act_j_request->use_incremental = true;
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "L robot released ball 1");
+    // // R robot move back to per 1 position
+    // R_act_j_request->target_joints = node->ball_R_per_1_joint_pose_;
+    // R_act_j_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "R robot moved back to ball per 1 position");
+    // // L & R robot move back to initial position
+    // L_act_j_request->target_joints   = node->ball_L_joint_init_pose_;
+    // L_act_j_request->use_incremental = false; // 使用绝对位置
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // R_act_j_request->target_joints   = node->ball_R_joint_init_pose_;
+    // R_act_j_request->use_incremental = false; // 使用绝对位置
+    // R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 1000))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "L & R robots moved back to initial positions");
 
-    // R robot move back to per 1 position
-    R_act_j_request->target_joints = node->ball_R_per_1_joint_pose_;
-    R_act_j_response               = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "R robot moved back to ball per 1 position");
-    // L & R robot move back to initial position
-    L_act_j_request->target_joints   = node->ball_L_joint_init_pose_;
-    L_act_j_request->use_incremental = false; // 使用绝对位置
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    R_act_j_request->target_joints   = node->ball_R_joint_init_pose_;
-    R_act_j_request->use_incremental = false; // 使用绝对位置
-    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 1000))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "L & R robots moved back to initial positions");
+    // // R robot move to ball 2 position
+    // R_act_j_request->target_joints   = node->ball_R_2_joint_pose_;
+    // R_act_j_request->point_count     = 100;   // 100个点
+    // R_act_j_request->message_time    = 0.01;  // 0.01
+    // R_act_j_request->use_incremental = false; // 使用绝对位置
+    // R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "R robot moved to ball 2 position");
 
-    // R robot move to ball 2 position
-    R_act_j_request->target_joints   = node->ball_R_2_joint_pose_;
-    R_act_j_request->point_count     = 100;   // 100个点
-    R_act_j_request->message_time    = 0.01;  // 0.01
-    R_act_j_request->use_incremental = false; // 使用绝对位置
-    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "R robot moved to ball 2 position");
+    // // L robot move to ball 2 position
+    // L_act_j_request->target_joints   = node->ball_L_2_joint_pose_;
+    // L_act_j_request->point_count     = 100;   // 100个点
+    // L_act_j_request->message_time    = 0.01;  // 0.01
+    // L_act_j_request->use_incremental = false; // 使用绝对位置
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, -10, 0 };        // L robot 抓取球1
+    // L_act_j_request->use_incremental = true;
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // RCLCPP_INFO(node->get_logger(), "L robot moved to ball 2 position");
 
-    // L robot move to ball 2 position
-    L_act_j_request->target_joints   = node->ball_L_2_joint_pose_;
-    L_act_j_request->point_count     = 100;   // 100个点
-    L_act_j_request->message_time    = 0.01;  // 0.01
-    L_act_j_request->use_incremental = false; // 使用绝对位置
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, -10, 0 };        // L robot 抓取球1
-    L_act_j_request->use_incremental = true;
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    RCLCPP_INFO(node->get_logger(), "L robot moved to ball 2 position");
-
-    // L&R open hand
-    L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 16, 0 }; // L robot 松手
-    L_act_j_request->use_incremental = true;
-    L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->L_robot_act_j_client_,
-        L_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "L/robot_act_j"
-    );
-    R_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 8, 0 }; // R robot 松手
-    R_act_j_request->use_incremental = true;
-    R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
-        node->R_robot_act_j_client_,
-        R_act_j_request,
-        node,
-        std::chrono::seconds(10),
-        "R/robot_act_j"
-    );
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
-    RCLCPP_INFO(node->get_logger(), "L robot released ball 2");
+    // // L&R open hand
+    // L_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 16, 0 }; // L robot 松手
+    // L_act_j_request->use_incremental = true;
+    // L_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->L_robot_act_j_client_,
+    //     L_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "L/robot_act_j"
+    // );
+    // R_act_j_request->target_joints   = std::vector<double> { 0, 0, 0, 0, 8, 0 }; // R robot 松手
+    // R_act_j_request->use_incremental = true;
+    // R_act_j_response                 = ServiceCaller<robo_ctrl::srv::RobotActJ>::callServiceSync(
+    //     node->R_robot_act_j_client_,
+    //     R_act_j_request,
+    //     node,
+    //     std::chrono::seconds(10),
+    //     "R/robot_act_j"
+    // );
+    // std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(1000 + 750))); // 运动时间 + 额外500ms
+    // RCLCPP_INFO(node->get_logger(), "L robot released ball 2");
 
     rclcpp::shutdown();
     return 0;
@@ -2479,22 +2642,26 @@ void open_castbon() {
 
 int L_fix(
     std::shared_ptr<RobotMain>& node,
-    std::vector<double, std::allocator<double>>& orientation_increment,
     double& total_angle_diff,
     std::shared_ptr<robo_ctrl::srv::RobotMoveCart_Request>& fix_request,
     std::shared_ptr<robo_ctrl::srv::RobotMoveCart_Response>& fix_response,
     bool& retFlag
 ) {
+    std::vector<double> orientation_increment;
     retFlag = true;
     {
         std::lock_guard<std::mutex> lock(node->L_robot_state_mutex_);
         if (node->L_robot_state_) {
-            orientation_increment = { 0,
+             orientation_increment = { 0,
                                       0,
                                       0,
-                                      -90.0 - node->L_robot_state_->tcp_pose.rx,
+                                      180.0 - node->L_robot_state_->tcp_pose.rx,
                                       0.0 - node->L_robot_state_->tcp_pose.ry,
                                       -90.0 - node->L_robot_state_->tcp_pose.rz };
+        }
+        else {
+            RCLCPP_ERROR(node->get_logger(), "L robot state is null, cannot fix orientation");
+            return 1;
         }
     }
 

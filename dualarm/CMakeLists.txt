@@ -22,9 +22,13 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(depth_handler REQUIRED)
 find_package(detector REQUIRED)
+find_package(grab_detect REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(OpenCV REQUIRED)
 
 include_directories(include)
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 # 创建卡尔曼滤波器库
 add_library(kalman_filter src/kalman.cpp)
@@ -33,6 +37,7 @@ target_link_libraries(kalman_filter Eigen3::Eigen)
 add_executable(dualarm_node 
                 src/main.cpp
                 src/kalman.cpp)
+target_link_libraries(dualarm_node ${OpenCV_LIBS})
 ament_target_dependencies(dualarm_node
   rclcpp
   rclcpp_action
@@ -45,12 +50,15 @@ ament_target_dependencies(dualarm_node
   visualization_msgs
   depth_handler
   detector
+  grab_detect
+  cv_bridge
 )
 
 # 创建 robot_main 可执行文件
 add_executable(robot_main 
                 src/main.cpp
                 src/kalman.cpp)
+target_link_libraries(robot_main ${OpenCV_LIBS})
 ament_target_dependencies(robot_main
   rclcpp
   rclcpp_action
@@ -63,6 +71,8 @@ ament_target_dependencies(robot_main
   visualization_msgs
   depth_handler
   detector
+  grab_detect
+  cv_bridge
 )
 
 # 创建卡尔曼滤波器示例程序
@@ -73,6 +83,7 @@ target_link_libraries(kalman_example kalman_filter Eigen3::Eigen)
 add_executable(robot_main_refactored 
                 src/main_refactored.cpp
                 src/kalman.cpp)
+target_link_libraries(robot_main_refactored ${OpenCV_LIBS})
 ament_target_dependencies(robot_main_refactored
   rclcpp
   rclcpp_action
@@ -85,6 +96,8 @@ ament_target_dependencies(robot_main_refactored
   visualization_msgs
   depth_handler
   detector
+  grab_detect
+  cv_bridge
 )
 
 install(TARGETS dualarm_node robot_main kalman_example robot_main_refactored

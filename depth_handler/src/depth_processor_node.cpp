@@ -316,7 +316,7 @@ std::vector<Eigen::Vector3f> depth_handler::depth_node::depthToPoints(
     if (unclassed_points.size() > 5000) {
         std::vector<Eigen::Vector3f> downsampled_points;
         downsampled_points.reserve(5000);
-        for (size_t i = 0; i < unclassed_points.size(); i += 5) {
+        for (size_t i = 0; i < unclassed_points.size(); i += 3) {
             downsampled_points.emplace_back(unclassed_points[i]);
         }
         unclassed_points = downsampled_points;
@@ -329,7 +329,7 @@ std::vector<Eigen::Vector3f> depth_handler::depth_node::depthToPoints(
     auto end2                             = std::chrono::high_resolution_clock::now();
     // return largest cluster
     for (const auto& cluster: result) {
-        if (cluster.size() < 3000 || cluster.size() > 100000)
+        if (cluster.size() < 1000 || cluster.size() > 100000)
             continue;
         for (auto& point: cluster) {
             points.emplace_back(point);

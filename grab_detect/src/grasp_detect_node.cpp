@@ -3,6 +3,15 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include "grab_detect/msg/grasp_result.hpp"
 #include "grab_detect/srv/grasp_detect.hpp"
@@ -28,6 +37,12 @@ public:
         this->declare_parameter("depth_image_topic", "/depth/image_raw");
         this->declare_parameter("mask_image_topic", "");
         this->declare_parameter("service_name", "grasp_detect");
+        this->declare_parameter("visualization_frame", "camera_link");
+        this->declare_parameter("publish_visualization", true);
+        this->declare_parameter("target_robot_frame", "Lrobot_base");
+        this->declare_parameter("publish_grasp_tf", true);
+        this->declare_parameter("fake_gripper_frame", "fake_gripper_frame");
+        // this->declare_parameter("visualization_frame", "camera_frame");
 
         // 获取参数
         server_host_    = this->get_parameter("server_host").as_string();
@@ -39,6 +54,23 @@ public:
         auto depth_topic   = this->get_parameter("depth_image_topic").as_string();
         auto mask_topic    = this->get_parameter("mask_image_topic").as_string();
         auto service_name  = this->get_parameter("service_name").as_string();
+        visualization_frame_ = this->get_parameter("visualization_frame").as_string();
+        publish_visualization_ = this->get_parameter("publish_visualization").as_bool();
+        target_robot_frame_ = this->get_parameter("target_robot_frame").as_string();
+        publish_grasp_tf_ = this->get_parameter("publish_grasp_tf").as_bool();
+        fake_gripper_frame_ = this->get_parameter("fake_gripper_frame").as_string();
+
+        // 初始化 TF 组件
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+
+        // 创建可视化发布者
+        if (publish_visualization_) {
+            marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+                "/grasp_detect/markers", 10);
+            RCLCPP_INFO(this->get_logger(), "Publishing visualization markers on /grasp_detect/markers");
+        }
 
         // 创建订阅者
         trigger_sub_ = this->create_subscription<std_msgs::msg::Empty>(
@@ -117,6 +149,14 @@ private:
 
         if (response->success) {
             RCLCPP_INFO(this->get_logger(), "Detection successful! Found %d grasps", response->num_grasps);
+            // 可视化结果
+            if (publish_visualization_) {
+                publish_grasp_markers(response->grasps);
+            }
+            // 发布最高分抓取点的 TF
+            if (publish_grasp_tf_ && !response->grasps.empty()) {
+                publish_best_grasp_tf(response->grasps);
+            }
         } else {
             RCLCPP_ERROR(this->get_logger(), "Detection failed: %s", response->message.c_str());
         }
@@ -173,6 +213,15 @@ private:
         response->num_grasps = detect_response->num_grasps;
         response->message    = detect_response->message;
         response->grasps     = detect_response->grasps;
+
+        // 可视化结果
+        if (response->success && publish_visualization_) {
+            publish_grasp_markers(response->grasps);
+        }
+        // 发布最高分抓取点的 TF
+        if (response->success && publish_grasp_tf_ && !response->grasps.empty()) {
+            publish_best_grasp_tf(response->grasps);
+        }
     }
 
     void trigger_mask_service_callback(
@@ -204,6 +253,317 @@ private:
         response->num_grasps = detect_response->num_grasps;
         response->message    = detect_response->message;
         response->grasps     = detect_response->grasps;
+
+        // 计算最佳抓取在 fake_gripper_frame 下的坐标
+        if (response->success && !response->grasps.empty()) {
+            RCLCPP_INFO(this->get_logger(), 
+                "Attempting to transform best grasp from %s to %s",
+                visualization_frame_.c_str(), fake_gripper_frame_.c_str());
+            
+            try {
+                // 找到分数最高的抓取点
+                auto best_grasp_it = std::max_element(response->grasps.begin(), response->grasps.end(),
+                    [](const grab_detect::msg::GraspResult& a, const grab_detect::msg::GraspResult& b) {
+                        return a.score < b.score;
+                    });
+                const auto& best_grasp = *best_grasp_it;
+
+                RCLCPP_INFO(this->get_logger(), 
+                    "Best grasp in %s: pos=[%.3f, %.3f, %.3f]",
+                    visualization_frame_.c_str(),
+                    best_grasp.translation[0],
+                    best_grasp.translation[1],
+                    best_grasp.translation[2]);
+
+                // 将旋转矩阵转换为四元数
+                tf2::Matrix3x3 rot_matrix(
+                    best_grasp.rotation_matrix[0], best_grasp.rotation_matrix[1], best_grasp.rotation_matrix[2],
+                    best_grasp.rotation_matrix[3], best_grasp.rotation_matrix[4], best_grasp.rotation_matrix[5],
+                    best_grasp.rotation_matrix[6], best_grasp.rotation_matrix[7], best_grasp.rotation_matrix[8]
+                );
+                tf2::Quaternion quat;
+                rot_matrix.getRotation(quat);
+
+                // 创建 grasp 在 camera 坐标系的 pose
+                geometry_msgs::msg::PoseStamped grasp_pose_camera;
+                grasp_pose_camera.header.frame_id = visualization_frame_;
+                grasp_pose_camera.header.stamp = this->now();
+                grasp_pose_camera.pose.position.x = best_grasp.translation[0];
+                grasp_pose_camera.pose.position.y = best_grasp.translation[1];
+                grasp_pose_camera.pose.position.z = best_grasp.translation[2];
+                grasp_pose_camera.pose.orientation.x = quat.x();
+                grasp_pose_camera.pose.orientation.y = quat.y();
+                grasp_pose_camera.pose.orientation.z = quat.z();
+                grasp_pose_camera.pose.orientation.w = quat.w();
+
+                RCLCPP_INFO(this->get_logger(), "Looking up transform...");
+                
+                // 查询从 fake_gripper_frame 到 visualization_frame 的变换
+                geometry_msgs::msg::TransformStamped transform_gripper_to_camera;
+                transform_gripper_to_camera = tf_buffer_->lookupTransform(
+                    fake_gripper_frame_, visualization_frame_,
+                    tf2::TimePointZero, std::chrono::milliseconds(500));
+
+                RCLCPP_INFO(this->get_logger(), "Transform found, applying...");
+                
+                // 转换到 fake_gripper_frame 坐标系
+                geometry_msgs::msg::PoseStamped grasp_pose_gripper;
+                tf2::doTransform(grasp_pose_camera, grasp_pose_gripper, transform_gripper_to_camera);
+
+                // 将四元数转换为欧拉角 (rx, ry, rz)
+                tf2::Quaternion q(
+                    grasp_pose_gripper.pose.orientation.x,
+                    grasp_pose_gripper.pose.orientation.y,
+                    grasp_pose_gripper.pose.orientation.z,
+                    grasp_pose_gripper.pose.orientation.w
+                );
+                tf2::Matrix3x3 m(q);
+                double roll, pitch, yaw;
+                m.getRPY(roll, pitch, yaw);
+
+                // 填充响应
+                response->best_under_gripper_fake = {
+                    static_cast<float>(grasp_pose_gripper.pose.position.x),
+                    static_cast<float>(grasp_pose_gripper.pose.position.y),
+                    static_cast<float>(grasp_pose_gripper.pose.position.z),
+                    static_cast<float>(roll),
+                    static_cast<float>(pitch),
+                    static_cast<float>(yaw)
+                };
+
+                RCLCPP_INFO(this->get_logger(), 
+                    "Best grasp in %s: pos=[%.3f, %.3f, %.3f], rpy=[%.3f, %.3f, %.3f]",
+                    fake_gripper_frame_.c_str(),
+                    grasp_pose_gripper.pose.position.x,
+                    grasp_pose_gripper.pose.position.y,
+                    grasp_pose_gripper.pose.position.z,
+                    roll, pitch, yaw);
+
+            } catch (const tf2::TransformException& ex) {
+                RCLCPP_WARN(this->get_logger(), 
+                    "Failed to transform grasp to %s frame: %s. Setting best_under_gripper_fake to empty.",
+                    fake_gripper_frame_.c_str(), ex.what());
+                response->best_under_gripper_fake.clear();
+            }
+        } else {
+            response->best_under_gripper_fake.clear();
+        }
+
+        // 可视化结果
+        if (response->success && publish_visualization_) {
+            publish_grasp_markers(response->grasps);
+        }
+        // 发布最高分抓取点的 TF
+        if (response->success && publish_grasp_tf_ && !response->grasps.empty()) {
+            publish_best_grasp_tf(response->grasps);
+        }
+    }
+
+    void publish_best_grasp_tf(const std::vector<grab_detect::msg::GraspResult>& grasps) {
+        if (grasps.empty()) return;
+
+        // 找到分数最高的抓取点
+        auto best_grasp_it = std::max_element(grasps.begin(), grasps.end(),
+            [](const grab_detect::msg::GraspResult& a, const grab_detect::msg::GraspResult& b) {
+                return a.score < b.score;
+            });
+
+        const auto& best_grasp = *best_grasp_it;
+        RCLCPP_INFO(this->get_logger(), "Best grasp score: %.3f", best_grasp.score);
+
+        // 将旋转矩阵转换为四元数
+        tf2::Matrix3x3 rot_matrix(
+            best_grasp.rotation_matrix[0], best_grasp.rotation_matrix[1], best_grasp.rotation_matrix[2],
+            best_grasp.rotation_matrix[3], best_grasp.rotation_matrix[4], best_grasp.rotation_matrix[5],
+            best_grasp.rotation_matrix[6], best_grasp.rotation_matrix[7], best_grasp.rotation_matrix[8]
+        );
+        tf2::Quaternion quat;
+        rot_matrix.getRotation(quat);
+
+        // 创建从 camera_link 到 grasp_target 的变换
+        geometry_msgs::msg::TransformStamped transform_camera_to_grasp;
+        transform_camera_to_grasp.header.stamp = this->now();
+        transform_camera_to_grasp.header.frame_id = visualization_frame_;
+        transform_camera_to_grasp.child_frame_id = "grasp_target_camera";
+        transform_camera_to_grasp.transform.translation.x = best_grasp.translation[0];
+        transform_camera_to_grasp.transform.translation.y = best_grasp.translation[1];
+        transform_camera_to_grasp.transform.translation.z = best_grasp.translation[2];
+        transform_camera_to_grasp.transform.rotation.x = quat.x();
+        transform_camera_to_grasp.transform.rotation.y = quat.y();
+        transform_camera_to_grasp.transform.rotation.z = quat.z();
+        transform_camera_to_grasp.transform.rotation.w = quat.w();
+
+        try {
+            // 查询从 target_robot_frame 到 visualization_frame 的变换
+            geometry_msgs::msg::TransformStamped transform_robot_to_camera;
+            transform_robot_to_camera = tf_buffer_->lookupTransform(
+                target_robot_frame_, visualization_frame_,
+                tf2::TimePointZero, std::chrono::milliseconds(500));
+
+            // 计算从 robot 到 grasp_target 的变换
+            // 先创建 grasp 在 camera 坐标系的 pose
+            geometry_msgs::msg::PoseStamped grasp_pose_camera;
+            grasp_pose_camera.header.frame_id = visualization_frame_;
+            grasp_pose_camera.header.stamp = this->now();
+            grasp_pose_camera.pose.position.x = best_grasp.translation[0];
+            grasp_pose_camera.pose.position.y = best_grasp.translation[1];
+            grasp_pose_camera.pose.position.z = best_grasp.translation[2];
+            grasp_pose_camera.pose.orientation.x = quat.x();
+            grasp_pose_camera.pose.orientation.y = quat.y();
+            grasp_pose_camera.pose.orientation.z = quat.z();
+            grasp_pose_camera.pose.orientation.w = quat.w();
+
+            // 转换到机器人坐标系
+            geometry_msgs::msg::PoseStamped grasp_pose_robot;
+            tf2::doTransform(grasp_pose_camera, grasp_pose_robot, transform_robot_to_camera);
+
+            // 发布从 robot 到 grasp_target 的 TF
+            geometry_msgs::msg::TransformStamped transform_robot_to_grasp;
+            transform_robot_to_grasp.header.stamp = this->now();
+            transform_robot_to_grasp.header.frame_id = target_robot_frame_;
+            transform_robot_to_grasp.child_frame_id = "grasp_target";
+            transform_robot_to_grasp.transform.translation.x = grasp_pose_robot.pose.position.x;
+            transform_robot_to_grasp.transform.translation.y = grasp_pose_robot.pose.position.y;
+            transform_robot_to_grasp.transform.translation.z = grasp_pose_robot.pose.position.z;
+            transform_robot_to_grasp.transform.rotation = grasp_pose_robot.pose.orientation;
+
+            tf_broadcaster_->sendTransform(transform_robot_to_grasp);
+
+            RCLCPP_INFO(this->get_logger(), 
+                "Published /grasp_target TF in %s frame: [%.3f, %.3f, %.3f]",
+                target_robot_frame_.c_str(),
+                grasp_pose_robot.pose.position.x,
+                grasp_pose_robot.pose.position.y,
+                grasp_pose_robot.pose.position.z);
+
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_WARN(this->get_logger(), 
+                "Failed to transform grasp to %s frame: %s",
+                target_robot_frame_.c_str(), ex.what());
+        }
+    }
+
+    void publish_grasp_markers(const std::vector<grab_detect::msg::GraspResult>& grasps) {
+        visualization_msgs::msg::MarkerArray marker_array;
+        auto stamp = this->now();
+
+        for (size_t i = 0; i < (grasps.size() > 0 ? 1 : 0 ); ++i) {
+            const auto& grasp = grasps[i];
+
+            // 将旋转矩阵转换为四元数
+            tf2::Matrix3x3 rot_matrix(
+                grasp.rotation_matrix[0], grasp.rotation_matrix[1], grasp.rotation_matrix[2],
+                grasp.rotation_matrix[3], grasp.rotation_matrix[4], grasp.rotation_matrix[5],
+                grasp.rotation_matrix[6], grasp.rotation_matrix[7], grasp.rotation_matrix[8]
+            );
+            tf2::Quaternion quat;
+            rot_matrix.getRotation(quat);
+
+            // 创建坐标轴标记（表示抓取姿态）
+            // x轴 - 蓝色（抓取方向）
+            visualization_msgs::msg::Marker x_axis;
+            x_axis.header.frame_id = visualization_frame_;
+            x_axis.header.stamp = stamp;
+            x_axis.ns = "grasp_axes";
+            x_axis.id = i * 10;
+            x_axis.type = visualization_msgs::msg::Marker::ARROW;
+            x_axis.action = visualization_msgs::msg::Marker::ADD;
+            x_axis.pose.position.x = grasp.translation[0];
+            x_axis.pose.position.y = grasp.translation[1];
+            x_axis.pose.position.z = grasp.translation[2];
+            x_axis.pose.orientation.x = quat.x();
+            x_axis.pose.orientation.y = quat.y();
+            x_axis.pose.orientation.z = quat.z();
+            x_axis.pose.orientation.w = quat.w();
+            x_axis.scale.x = 0.1;  // 轴长度
+            x_axis.scale.y = 0.01; // 箭头宽度
+            x_axis.scale.z = 0.01;
+            x_axis.color.r = 0.0;
+            x_axis.color.g = 0.0;
+            x_axis.color.b = 1.0;
+            x_axis.color.a = 0.8;
+            x_axis.lifetime = rclcpp::Duration::from_seconds(3);
+            marker_array.markers.push_back(x_axis);
+
+            // Y轴 - 绿色
+            tf2::Quaternion y_rot;
+            y_rot.setRPY(0, 0, M_PI/2);
+            tf2::Quaternion y_quat = quat * y_rot;
+            visualization_msgs::msg::Marker y_axis = x_axis;
+            y_axis.id = i * 10 + 1;
+            y_axis.pose.orientation.x = y_quat.x();
+            y_axis.pose.orientation.y = y_quat.y();
+            y_axis.pose.orientation.z = y_quat.z();
+            y_axis.pose.orientation.w = y_quat.w();
+            y_axis.color.r = 1.0;
+            y_axis.color.g = 0.0;
+            y_axis.color.b = 0.0;
+            marker_array.markers.push_back(y_axis);
+
+            // Z轴 - 红色
+            tf2::Quaternion z_rot;
+            z_rot.setRPY(0, -M_PI/2, 0);
+            tf2::Quaternion z_quat = quat * z_rot;
+            visualization_msgs::msg::Marker z_axis = x_axis;
+            z_axis.id = i * 10 + 2;
+            z_axis.pose.orientation.x = z_quat.x();
+            z_axis.pose.orientation.y = z_quat.y();
+            z_axis.pose.orientation.z = z_quat.z();
+            z_axis.pose.orientation.w = z_quat.w();
+            z_axis.color.r = 0.0;
+            z_axis.color.g = 1.0;
+            z_axis.color.b = 0.0;
+            marker_array.markers.push_back(z_axis);
+
+            // 创建夹爪框架标记（立方体表示抓取区域）
+            visualization_msgs::msg::Marker gripper_box;
+            gripper_box.header.frame_id = visualization_frame_;
+            gripper_box.header.stamp = stamp;
+            gripper_box.ns = "grasp_boxes";
+            gripper_box.id = i * 10 + 3;
+            gripper_box.type = visualization_msgs::msg::Marker::CUBE;
+            gripper_box.action = visualization_msgs::msg::Marker::ADD;
+            gripper_box.pose.position.x = grasp.translation[0];
+            gripper_box.pose.position.y = grasp.translation[1];
+            gripper_box.pose.position.z = grasp.translation[2];
+            gripper_box.pose.orientation.x = quat.x();
+            gripper_box.pose.orientation.y = quat.y();
+            gripper_box.pose.orientation.z = quat.z();
+            gripper_box.pose.orientation.w = quat.w();
+            gripper_box.scale.x = grasp.depth*4;
+            gripper_box.scale.y = grasp.width*4;
+            gripper_box.scale.z = grasp.height*4;
+            gripper_box.color.r = 0.0;
+            gripper_box.color.g = 1.0;
+            gripper_box.color.b = 1.0;
+            gripper_box.color.a = 0.3;
+            gripper_box.lifetime = rclcpp::Duration::from_seconds(3);
+            marker_array.markers.push_back(gripper_box);
+
+            // 添加文本标签显示得分
+            visualization_msgs::msg::Marker text;
+            text.header.frame_id = visualization_frame_;
+            text.header.stamp = stamp;
+            text.ns = "grasp_scores";
+            text.id = i * 10 + 4;
+            text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+            text.action = visualization_msgs::msg::Marker::ADD;
+            text.pose.position.x = grasp.translation[0];
+            text.pose.position.y = grasp.translation[1];
+            text.pose.position.z = grasp.translation[2] + 0.05; // 稍微上移
+            text.scale.z = 0.02; // 文字大小
+            text.color.r = 1.0;
+            text.color.g = 1.0;
+            text.color.b = 1.0;
+            text.color.a = 1.0;
+            text.text = "Score: " + std::to_string(grasp.score).substr(0, 4);
+            text.lifetime = rclcpp::Duration::from_seconds(3);
+            // marker_array.markers.push_back(text);
+        }
+
+        // 发布标记
+        marker_pub_->publish(marker_array);
+        RCLCPP_INFO(this->get_logger(), "Published %zu grasp visualization markers", marker_array.markers.size());
     }
 
     void process_detection(
@@ -380,6 +740,18 @@ private:
     sensor_msgs::msg::Image::SharedPtr latest_color_;
     sensor_msgs::msg::Image::SharedPtr latest_depth_;
     sensor_msgs::msg::Image::SharedPtr latest_mask_;
+
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+    std::string visualization_frame_;
+    bool publish_visualization_;
+
+    // TF 相关
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_broadcaster_;
+    std::string target_robot_frame_;
+    std::string fake_gripper_frame_;
+    bool publish_grasp_tf_;
 };
 
 int main(int argc, char** argv) {

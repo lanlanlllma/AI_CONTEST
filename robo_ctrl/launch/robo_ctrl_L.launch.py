@@ -26,7 +26,7 @@ def generate_launch_description():
     # 声明启动参数
     robot_ip_arg = DeclareLaunchArgument(
         'robot_ip',
-        default_value='10.2.20.201',
+        default_value='192.168.58.2',
         description='机器人控制器的IP地址'
     )
     
@@ -166,6 +166,20 @@ def generate_launch_description():
         name='gripper_node',
         output='screen')
     
+    detector_node = Node(
+        package='detector',
+        executable='detector_node_exe',
+        name='detector_node',
+        output='screen',
+    )
+
+    depth_handler_node = Node(
+        package='depth_handler',
+        executable='depth_processor_node',
+        name='depth_handler_node',  
+        output='screen'
+    )
+    
     # 返回启动描述
     return LaunchDescription([
         robot_ip_arg,
@@ -173,8 +187,8 @@ def generate_launch_description():
         robot_name_arg,
         state_query_interval_arg,
         robo_ctrl_node,
-        high_level_node
-        , fake_gripper_tf_publisher_node,
+        high_level_node, 
+        # fake_gripper_tf_publisher_node,
         declare_gripper_frame_cmd,
         declare_base_frame_cmd,
         declare_fake_frame_cmd,
@@ -185,5 +199,5 @@ def generate_launch_description():
         detector_node,
         depth_handler_node,
         camera_info_interceptor_node,
-        gripper_node
+        # gripper_node
     ])

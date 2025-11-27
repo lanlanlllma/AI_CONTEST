@@ -13,3 +13,10 @@ grasp_detect_node:
     
     # 服务配置
     service_name: "grasp_detect"
+    
+    # TF 坐标系配置
+    visualization_frame: "camera_link"
+    target_robot_frame: "Lrobot_base"
+    fake_gripper_frame: "fake_gripper_frame"
+    publish_visualization: true
+    publish_grasp_tf: true

@@ -21,6 +21,8 @@
 #include "depth_handler/msg/bbox3d_array.hpp"
 #include "detector/msg/bbox2d.hpp"
 #include "detector/msg/bbox2d_array.hpp"
+#include "grab_detect/srv/grasp_detect_trigger_mask.hpp"
+#include "grab_detect/msg/grasp_result.hpp"
 #include "dualarm/kalman.h"
 
 #include <tf2_ros/transform_listener.h>
@@ -33,6 +35,8 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <opencv4/opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.hpp>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -42,6 +46,13 @@ struct object_detection {
     std::vector<double> position; // 物体位置（X, Y, 通常不需要Z）
     int age         = 0;          // 物体检测年龄（帧数），初始为0
     int valid_count = 0;          // 有效检测次数，初始为0
+    bool has_seen_class_1 = false; // 是否曾经检测到 class_id=1
+    
+    // 存储最新的边界框信息（像素坐标）
+    float bbox_x = 0.0f;      // bbox 中心 x（像素）
+    float bbox_y = 0.0f;      // bbox 中心 y（像素）
+    float bbox_width = 0.0f;  // bbox 宽度（像素）
+    float bbox_height = 0.0f; // bbox 高度（像素）
 
     // 类别跳变检测：记录最近N帧的类别历史
     static constexpr int HISTORY_SIZE = 10; // 记录最近10帧
@@ -53,10 +64,21 @@ struct object_detection {
         if (class_history.size() > HISTORY_SIZE) {
             class_history.pop_front();
         }
+        
+        // 如果检测到 class_id=1，永久标记并设置 id
+        if (class_id == 1) {
+            has_seen_class_1 = true;
+            id = 1;
+        }
     }
 
     // 获取稳定的类别ID（多数投票）
     int get_stable_class_id() const {
+        // 如果曾经检测到 class_id=1，则永久返回 1
+        if (has_seen_class_1) {
+            return 1;
+        }
+        
         if (class_history.empty())
             return id;
 
@@ -95,7 +117,7 @@ struct object_detection {
 
     bool is_valid() const {
         // 需要类别稳定且有足够的有效检测次数，年龄不能太大
-        return valid_count >= 3 && age < 5 && is_class_stable();
+        return valid_count >= 3 && age < 5 && 1;
     }
 
     bool is_invalid() const {
@@ -202,6 +224,7 @@ public:
     rclcpp::Client<robo_ctrl::srv::RobotServo>::SharedPtr L_robot_servo_client_;
     rclcpp::Client<robo_ctrl::srv::RobotSetSpeed>::SharedPtr L_robot_set_speed_client_;
     rclcpp::Client<epg50_gripper_ros::srv::GripperCommand>::SharedPtr gripper_command_client_;
+    rclcpp::Client<grab_detect::srv::GraspDetectTriggerMask>::SharedPtr L_grasp_detect_mask_client_;
 
     // publishers
     rclcpp::Publisher<robo_ctrl::msg::TCPPose>::SharedPtr L_tcp_pose_pub_;
@@ -291,7 +314,7 @@ public:
     bool hasObject(int object_id) const {
         std::lock_guard<std::mutex> lock(detected_objects_mutex_);
         for (const auto& obj: detected_objects_) {
-            if (obj.id == object_id && obj.is_valid()) {
+            if (obj.id == object_id) {
                 return true;
             }
         }

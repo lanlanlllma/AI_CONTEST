@@ -22,6 +22,8 @@
   <depend>visualization_msgs</depend>
   <depend>depth_handler</depend>
   <depend>detector</depend>
+  <depend>grab_detect</depend>
+  <depend>cv_bridge</depend>
 
 
   <export>

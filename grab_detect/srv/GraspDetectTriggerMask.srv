@@ -6,3 +6,4 @@ bool success                      # 检测是否成功
 int32 num_grasps                  # 检测到的抓取数量
 string message                    # 返回消息或错误描述
 GraspResult[] grasps              # 抓取结果数组
+float32[] best_under_gripper_fake # 最佳结果在伪装夹爪下的坐标 [x, y, z, rx, ry, rz]
